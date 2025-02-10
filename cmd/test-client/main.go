@@ -1,69 +1,73 @@
-// cmd/test-client/main.go
 package main
 
 import (
-	"log"
-	"os"
-	"os/signal"
-	"time"
+    "flag"
+    "log"
+    "os"
+    "os/signal"
+    "time"
 
-	"github.com/gorilla/websocket"
+    "github.com/gorilla/websocket"
 )
 
 func main() {
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+    // Add command line flag for URL
+    url := flag.String("url", "ws://localhost:8080/ws", "WebSocket server URL")
+    flag.Parse()
 
-	log.Printf("Connecting to ws://localhost:8080/ws")
-	
-	headers := make(map[string][]string)
-	headers["Agent-ID"] = []string{"test-client"}
-	
-	c, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws", headers)
-	if err != nil {
-		log.Fatal("dial:", err)
-	}
-	defer c.Close()
+    interrupt := make(chan os.Signal, 1)
+    signal.Notify(interrupt, os.Interrupt)
 
-	done := make(chan struct{})
+    log.Printf("Connecting to %s", *url)
+    
+    headers := make(map[string][]string)
+    headers["Agent-ID"] = []string{"test-client"}
+    
+    c, _, err := websocket.DefaultDialer.Dial(*url, headers)
+    if err != nil {
+        log.Fatal("dial:", err)
+    }
+    defer c.Close()
 
-	go func() {
-		defer close(done)
-		for {
-			_, message, err := c.ReadMessage()
-			if err != nil {
-				log.Println("read:", err)
-				return
-			}
-			log.Printf("Received: %s", message)
-		}
-	}()
+    done := make(chan struct{})
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+    go func() {
+        defer close(done)
+        for {
+            _, message, err := c.ReadMessage()
+            if err != nil {
+                log.Println("read:", err)
+                return
+            }
+            log.Printf("Received: %s", message)
+        }
+    }()
 
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			err := c.WriteMessage(websocket.TextMessage, []byte("Hello, Server!"))
-			if err != nil {
-				log.Println("write:", err)
-				return
-			}
-		case <-interrupt:
-			log.Println("interrupt")
-			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				log.Println("write close:", err)
-				return
-			}
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-			}
-			return
-		}
-	}
+    ticker := time.NewTicker(time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-done:
+            return
+        case <-ticker.C:
+            err := c.WriteMessage(websocket.TextMessage, []byte("Hello, Server!"))
+            if err != nil {
+                log.Println("write:", err)
+                return
+            }
+        case <-interrupt:
+            log.Println("interrupt")
+            err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+            if err != nil {
+                log.Println("write close:", err)
+                return
+            }
+            select {
+            case <-done:
+            case <-time.After(time.Second):
+            }
+            return
+        }
+    }
 }
