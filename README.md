@@ -1,154 +1,220 @@
-# Traefik Connection Balancer Plugin
+# Traefik WebSocket Connection Balancer
 
-A Traefik middleware plugin that balances WebSocket connections across multiple backend pods based on their current connection load. This plugin is specifically designed to distribute WebSocket connections evenly while considering the existing connection count on each backend pod.
+A high-performance WebSocket connection balancer middleware for Traefik that distributes WebSocket connections across multiple backend pods based on their active connection count. This plugin is designed to ensure optimal load distribution for WebSocket-heavy applications.
 
 ## Features
 
-- Load balancing based on active connection counts
-- WebSocket connection support with bidirectional relay
-- Automatic failover when pods are unavailable
-- Configurable metric path for connection counting
-- Support for both HTTP and WebSocket protocols
-- TLS/SSL support for secure WebSocket connections
+- **Intelligent Load Balancing**
+  - Distributes connections based on real-time connection counts
+  - Automatic selection of least-loaded backend
+  - Connection count caching with configurable TTL
+  - Graceful failover on backend failures
 
-## Prerequisites
+- **WebSocket Support**
+  - Full WebSocket protocol support (RFC 6455)
+  - Bidirectional message relay
+  - Transparent protocol upgrade handling
+  - Support for WebSocket extensions and subprotocols
 
+- **Advanced Configuration**
+  - Configurable metrics endpoint
+  - Adjustable timeouts (dial, read, write)
+  - TLS/SSL verification options
+  - Custom header forwarding
+
+- **Monitoring & Debugging**
+  - Detailed logging of connection events
+  - Connection metrics exposure
+  - Error tracking and reporting
+  - Debug-friendly log messages
+
+## Quick Start
+
+### Prerequisites
 - Go 1.22 or higher
-- Traefik v2.10.4 or higher
-- Docker (for building and running the container)
-- Make (optional, for using Makefile commands)
+- gorilla/websocket v1.5.3 or higher
 
-## Installation
+### Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/K8Trust/traefikwsbalancer.git
+git clone https://github.com/yourusername/traefikwsbalancer.git
 cd traefikwsbalancer
 ```
 
-2. Build the plugin:
-```bash
-make all
-```
-
-Or manually:
+2. Install dependencies:
 ```bash
 go mod tidy
-go mod vendor
-go build -o connectionbalancer
+```
+
+3. Build the project:
+```bash
+go build ./...
+```
+
+### Basic Usage
+
+1. Start the test server (provides backend WebSocket endpoints):
+```bash
+go run cmd/test-server/main.go
+```
+
+2. In a separate terminal, run the test client:
+```bash
+go run cmd/test-client/main.go
 ```
 
 ## Configuration
 
-### Plugin Configuration
+### Core Components
 
-Add the following to your Traefik static configuration (traefik.yml):
+The balancer consists of three main components:
+1. WebSocket Balancer (main middleware)
+2. Connection Fetcher (metrics collector)
+3. WebSocket Relay (message forwarder)
 
-```yaml
-experimental:
-  plugins:
-    connectionbalancer:
-      moduleName: "github.com/K8Trust/traefikwsbalancer"
-      version: "v2.10.4"
+### Configuration Options
+
+```go
+type Config struct {
+    MetricPath    string        // Path to fetch connection metrics
+    Pods          []string      // List of backend pod URLs
+    TLSVerify     bool         // Enable/disable TLS verification
+    CacheTTL      time.Duration // Metrics cache duration
+    DialTimeout   time.Duration // WebSocket connection timeout
+    WriteTimeout  time.Duration // Write operation timeout
+    ReadTimeout   time.Duration // Read operation timeout
+}
 ```
 
-### Dynamic Configuration
+### Default Values
+- MetricPath: "/metric"
+- TLSVerify: true
+- CacheTTL: 30 seconds
+- DialTimeout: 10 seconds
+- WriteTimeout: 10 seconds
+- ReadTimeout: 30 seconds
 
-Configure the plugin in your dynamic configuration:
+## Architecture
 
-```yaml
-http:
-  middlewares:
-    connectionbalancer:
-      plugin:
-        connectionbalancer:
-          metricPath: "/metric"
-          pods:
-            - "http://kbrain-socket-agent-ktrust-service.phaedra.svc.cluster.local:80"
-            - "http://kbrain-user-socket-ktrust-service.phaedra.svc.cluster.local:80"
-```
+### Connection Flow
+1. Client initiates WebSocket connection
+2. Balancer checks connection counts from all backends
+3. Selects backend with lowest connection count
+4. Establishes connection to chosen backend
+5. Sets up bidirectional relay
+6. Monitors connection health
+
+### Load Balancing Algorithm
+- Maintains cache of connection counts
+- Updates counts based on CacheTTL
+- Uses atomic operations for thread safety
+- Handles backend failures gracefully
 
 ## Development
 
-### Directory Structure
-
+### Project Structure
 ```
-.
-├── .gitlab-ci.yml             # GitLab CI/CD configuration
-├── .golangci.yml              # Golangci-lint configuration
-├── .traefik.yml               # Traefik configuration
-├── Dockerfile                 # Multi-stage build configuration
-├── Makefile                   # Build automation
-├── connectionbalancer.go      # Main plugin implementation
-├── connectionbalancer_test.go # Unit tests
-├── go.mod                     # Go module definition
-└── go.sum                     # Go module checksums
+traefikwsbalancer/
+├── cmd/
+│   ├── test-client/
+│   │   └── main.go
+│   └── test-server/
+│       └── main.go
+├── traefikwsbalancer.go
+├── go.mod
+└── go.sum
 ```
 
-### Available Make Commands
+### Testing
 
-- `make all`: Run all build steps (tidy, vendor, build)
-- `make tidy`: Run go mod tidy
-- `make vendor`: Create vendor directory
-- `make lint`: Run golangci-lint
-- `make test`: Run unit tests
-- `make build`: Build the plugin binary
+The project includes several test types:
+- Unit tests for core functionality
+- Integration tests for WebSocket handling
+- Load tests for connection management
 
-### Running Tests
-
+Run tests:
 ```bash
-make test
+go test ./...
 ```
 
-Or manually:
-```bash
-go test -v ./...
+## Production Deployment
+
+### Best Practices
+1. **Security**
+   - Enable TLS verification in production
+   - Implement proper origin checking
+   - Set appropriate timeouts
+
+2. **Performance**
+   - Adjust CacheTTL based on load
+   - Monitor connection counts
+   - Set appropriate buffer sizes
+
+3. **Monitoring**
+   - Log connection events
+   - Track metrics
+   - Monitor backend health
+
+### Example Configuration
+
+```yaml
+wsbalancer:
+  metricPath: "/metric"
+  pods:
+    - "http://backend1:8080"
+    - "http://backend2:8080"
+  tlsVerify: true
+  cacheTTL: "30s"
+  dialTimeout: "10s"
+  writeTimeout: "10s"
+  readTimeout: "30s"
 ```
 
-### Linting
+## Troubleshooting
 
-```bash
-make lint
-```
+### Common Issues
 
-## CI/CD Pipeline
+1. **Connection Failures**
+   - Check backend availability
+   - Verify network connectivity
+   - Check TLS configuration
 
-The project includes a GitLab CI/CD pipeline with the following stages:
+2. **Performance Issues**
+   - Monitor connection counts
+   - Adjust cache TTL
+   - Check backend resources
 
-- `lint`: Runs golangci-lint for code quality checks
-- `test`: Executes unit tests
-- `build`: Builds and pushes multi-arch Docker images
+3. **Protocol Errors**
+   - Verify WebSocket upgrade headers
+   - Check protocol compatibility
+   - Monitor message sizes
 
-The pipeline automatically builds and pushes Docker images for both AMD64 and ARM64 architectures when:
-- A new tag is pushed
-- Changes are merged to the main branch (manual trigger required)
+### Debugging
 
-## Docker
-
-### Building the Image
-
-```bash
-docker build -t traefikwsbalancer .
-```
-
-### Running the Container
-
-```bash
-docker run -p 80:80 traefikwsbalancer
+Enable detailed logging:
+```go
+log.SetFlags(log.Lshortfile | log.Ltime | log.Lmicroseconds)
 ```
 
 ## Contributing
 
 1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Merge Request
+2. Create your feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
 
 ## License
 
-[Include your license information here]
+MIT License
 
-## Contact
+## Support
 
-[Include contact information or maintainer details here]
+For issues and feature requests, please create an issue in the GitHub repository.
+
+## Acknowledgments
+
+- gorilla/websocket team for the excellent WebSocket implementation
+- Traefik team for the plugin system
+- Contributors who have helped improve this project
