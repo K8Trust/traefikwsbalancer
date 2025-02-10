@@ -1,3 +1,4 @@
+// traefikwsbalancer.go
 package traefikwsbalancer
 
 import (
@@ -181,7 +182,7 @@ func (cb *WSBalancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Create new proxy request
+	// Regular HTTP proxy handling
 	targetURL := selectedPod + req.URL.Path
 	proxyReq, err := http.NewRequest(req.Method, targetURL, nil)
 	if err != nil {
@@ -246,20 +247,31 @@ func (cb *WSBalancer) handleWebSocket(targetPod string, rw http.ResponseWriter, 
 		HandshakeTimeout: cb.DialTimeout,
 	}
 
-	// Copy headers for the backend connection
-	headers := make(http.Header)
-	if agentID := req.Header.Get("Agent-ID"); agentID != "" {
-		headers.Set("Agent-ID", agentID)
+	// Copy headers from the original request, excluding WebSocket-specific headers
+	headers := http.Header{}
+	for key, values := range req.Header {
+		// Skip headers that will be set by the WebSocket client
+		if key == "Upgrade" || key == "Connection" || 
+		   key == "Sec-Websocket-Key" || key == "Sec-Websocket-Version" {
+			continue
+		}
+		headers[key] = values
 	}
+	
+	// Ensure host is set
+	headers.Set("Host", req.Host)
 
 	// Connect to backend
 	backendConn, resp, err := dialer.Dial(targetURL, headers)
 	if err != nil {
-		if resp != nil {
-			copyHeader(rw.Header(), resp.Header)
-			rw.WriteHeader(resp.StatusCode)
+		log.Printf("Failed to connect to backend websocket: %v", err)
+		if resp != nil && resp.Body != nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			log.Printf("Backend response: %s", body)
+			http.Error(rw, fmt.Sprintf("Backend connection failed: %s", body), http.StatusBadGateway)
 		} else {
-			http.Error(rw, "Failed to connect to WebSocket backend", http.StatusBadGateway)
+			http.Error(rw, fmt.Sprintf("Failed to connect to WebSocket backend: %v", err), http.StatusBadGateway)
 		}
 		return
 	}
@@ -272,8 +284,7 @@ func (cb *WSBalancer) handleWebSocket(targetPod string, rw http.ResponseWriter, 
 	// Upgrade the client connection
 	clientConn, err := upgrader.Upgrade(rw, req, nil)
 	if err != nil {
-		http.Error(rw, "Failed to upgrade client connection", http.StatusInternalServerError)
-		return
+		return // Error is already written to response by Upgrade method
 	}
 	defer clientConn.Close()
 
@@ -308,14 +319,5 @@ func relay(dest, src *websocket.Conn, errChan chan error) {
 		// Update deadlines after successful message transfer
 		src.SetReadDeadline(time.Now().Add(30 * time.Second))
 		dest.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	}
-}
-
-// copyHeader copies headers from source to destination
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
 	}
 }
