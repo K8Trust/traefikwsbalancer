@@ -22,7 +22,7 @@ A Traefik middleware plugin that balances WebSocket connections across multiple 
 
 1. Clone the repository:
 ```bash
-git clone https://gitlab.com/ktrust/devops/solution/traefikwsbalancer.git
+git clone https://github.com/K8Trust/traefikwsbalancer.git
 cd traefikwsbalancer
 ```
 
@@ -48,7 +48,7 @@ Add the following to your Traefik static configuration (traefik.yml):
 experimental:
   plugins:
     connectionbalancer:
-      moduleName: "gitlab.com/ktrust/devops/solution/traefikwsbalancer"
+      moduleName: "github.com/K8Trust/traefikwsbalancer"
       version: "v2.10.4"
 ```
 

@@ -1,17 +1,17 @@
-global:
-  checkNewVersion: false
-  sendAnonymousUsage: false
+displayName: WebSocket Connection Balancer
+type: middleware
 
-experimental:
-  plugins:
-    connectionbalancer:
-      moduleName: "gitlab.com/ktrust/devops/solution/traefikwsbalancer"
-      version: "v2.10.4"
+import: github.com/K8Trust/traefikwsbalancer
 
-entryPoints:
-  web:
-    address: ":80"
+summary: 'A Traefik middleware plugin that balances WebSocket connections across multiple pods based on connection count'
 
-providers:
-  file:
-    filename: "/etc/traefik/dynamic.yml"
+testData:
+  metricPath: /metric
+  pods:
+    - http://test-pod-1:8080
+    - http://test-pod-2:8080
+  tlsVerify: true
+  cacheTTL: 30s
+  dialTimeout: 10s
+  writeTimeout: 10s
+  readTimeout: 30s
