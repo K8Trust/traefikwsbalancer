@@ -1,15 +1,15 @@
+# .traefik.yml
 displayName: WebSocket Connection Balancer
 type: middleware
-
 import: github.com/K8Trust/traefikwsbalancer
-
-summary: 'A Traefik middleware plugin that balances WebSocket connections across multiple pods based on connection count'
+summary: Balance WebSocket connections across multiple backends based on connection count
+iconPath: /assets/icon.png
 
 testData:
   metricPath: /metric
   pods:
-    - http://test-pod-1:8080
-    - http://test-pod-2:8080
+    - http://localhost:8081
+    - http://localhost:8082
   tlsVerify: true
   cacheTTL: 30s
   dialTimeout: 10s

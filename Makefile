@@ -1,18 +1,36 @@
-.PHONY: all test lint build
+# Makefile
+.PHONY: lint test vendor tidy yaml-test clean all build
 
-all: tidy vendor build
+PLUGIN_NAME := traefikwsbalancer
+VERSION := v0.1.0
 
-tidy:
-	go mod tidy
+all: clean lint test build
+
+lint:
+	golangci-lint run
+
+test:
+	go test -v -cover ./...
 
 vendor:
 	go mod vendor
 
-lint:
-	golangci-lint run --timeout=5m --modules-download-mode=vendor
+tidy:
+	go mod tidy
 
-test:
-	go test -v ./...
+yaml-test:
+	yamllint .traefik.yml
 
-build:
-	go build -o connectionbalancer ./...
+clean:
+	rm -rf ./vendor
+	rm -f coverage.out
+
+build: tidy vendor
+	go build -o $(PLUGIN_NAME)
+
+# Traefik plugin specific targets
+dev-plugin:
+	traefik --config-file=dev.yml
+
+validate-plugin:
+	yaegi test -v github.com/K8Trust/traefikwsbalancer
