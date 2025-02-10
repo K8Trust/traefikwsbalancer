@@ -1,0 +1,17 @@
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+experimental:
+  plugins:
+    connectionbalancer:
+      moduleName: "gitlab.com/ktrust/devops/solution/traefikwsbalancer"
+      version: "v2.10.4"
+
+entryPoints:
+  web:
+    address: ":80"
+
+providers:
+  file:
+    filename: "/etc/traefik/dynamic.yml"
