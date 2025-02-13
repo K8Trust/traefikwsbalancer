@@ -6,7 +6,7 @@ summary: Balance WebSocket connections across multiple backends based on connect
 
 testData:
   metricPath: /metric
-  pods:
-    - http://localhost:8081
-    - http://localhost:8082
+  services:
+    - http://websocket-service-1.default.svc.cluster.local:80
+    - http://websocket-service-2.default.svc.cluster.local:80
   cacheTTL: 30
