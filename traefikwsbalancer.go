@@ -1,4 +1,3 @@
-// Package traefikwsbalancer provides a simple connection-based load balancer
 package traefikwsbalancer
 
 import (
@@ -14,47 +13,47 @@ import (
 
 // Config represents the plugin configuration
 type Config struct {
-	MetricPath string        `json:"metricPath,omitempty" yaml:"metricPath"`
-	Pods       []string      `json:"pods,omitempty" yaml:"pods"`
-	CacheTTL   time.Duration `json:"cacheTTL" yaml:"cacheTTL"`
+	MetricPath string   `json:"metricPath,omitempty" yaml:"metricPath"`
+	Pods       []string `json:"pods,omitempty" yaml:"pods"`
+	CacheTTL   int      `json:"cacheTTL" yaml:"cacheTTL"` // TTL in seconds
 }
 
 // CreateConfig creates the default plugin configuration
 func CreateConfig() *Config {
 	return &Config{
 		MetricPath: "/metric",
-		CacheTTL:   30 * time.Second,
+		CacheTTL:   30, // 30 seconds default
 	}
 }
 
 // Balancer is the connection balancer plugin
 type Balancer struct {
-	next     http.Handler
-	name     string
-	pods     []string
-	client   *http.Client
+	next       http.Handler
+	name       string
+	pods       []string
+	client     *http.Client
 	metricPath string
 
 	// Connection caching
-	connCache   sync.Map
-	cacheTTL    time.Duration
-	lastUpdate  time.Time
-	updateMutex sync.Mutex
+	connCache    sync.Map
+	cacheTTL     time.Duration
+	lastUpdate   time.Time
+	updateMutex  sync.Mutex
 }
 
 // New creates a new plugin instance
-func New(_ context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	if len(config.Pods) == 0 {
 		return nil, fmt.Errorf("no pods configured")
 	}
 
 	return &Balancer{
-		next:      next,
-		name:      name,
-		pods:      config.Pods,
-		client:    &http.Client{Timeout: 5 * time.Second},
+		next:       next,
+		name:       name,
+		pods:       config.Pods,
+		client:     &http.Client{Timeout: 5 * time.Second},
 		metricPath: config.MetricPath,
-		cacheTTL:  config.CacheTTL,
+		cacheTTL:   time.Duration(config.CacheTTL) * time.Second,
 	}, nil
 }
 

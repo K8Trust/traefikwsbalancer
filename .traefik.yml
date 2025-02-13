@@ -10,8 +10,4 @@ testData:
   pods:
     - http://localhost:8081
     - http://localhost:8082
-  tlsVerify: true
-  cacheTTL: 30s
-  dialTimeout: 10s
-  writeTimeout: 10s
-  readTimeout: 30s
+  cacheTTL: 30
