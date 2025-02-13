@@ -3,7 +3,6 @@ displayName: WebSocket Connection Balancer
 type: middleware
 import: github.com/K8Trust/traefikwsbalancer
 summary: Balance WebSocket connections across multiple backends based on connection count
-iconPath: /assets/icon.png
 
 testData:
   metricPath: /metric
