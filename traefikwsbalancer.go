@@ -7,8 +7,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // ConnectionFetcher interface for getting connection counts
@@ -163,8 +166,121 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.URL.Path,
 		allServiceConnections)
 
+	// Check if this is a WebSocket upgrade request
+	if websocket.IsWebSocketUpgrade(req) {
+		log.Printf("[DEBUG] Handling WebSocket upgrade request")
+		b.handleWebSocket(rw, req, selectedService)
+		return
+	}
+
+	// Handle regular HTTP request
+	b.handleHTTP(rw, req, selectedService)
+}
+
+func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, targetService string) {
+    // Configure dialer with timeouts
+    dialer := websocket.Dialer{
+        HandshakeTimeout: b.DialTimeout,
+        ReadBufferSize:   1024,
+        WriteBufferSize:  1024,
+    }
+
+    // Create target URL for the backend service
+    targetURL := "ws" + strings.TrimPrefix(targetService, "http") + req.URL.Path
+    if req.URL.RawQuery != "" {
+        targetURL += "?" + req.URL.RawQuery
+    }
+
+    log.Printf("[DEBUG] Dialing backend WebSocket service at %s", targetURL)
+
+    // Clean headers for backend connection
+    cleanHeaders := make(http.Header)
+    for k, v := range req.Header {
+        switch k {
+        case "Upgrade", "Connection", "Sec-Websocket-Key",
+             "Sec-Websocket-Version", "Sec-Websocket-Extensions",
+             "Sec-Websocket-Protocol":
+            // Skip WebSocket-specific headers
+            continue
+        default:
+            cleanHeaders[k] = v
+        }
+    }
+
+    // Connect to the backend
+    backendConn, resp, err := dialer.Dial(targetURL, cleanHeaders)
+    if err != nil {
+        log.Printf("[ERROR] Failed to connect to backend WebSocket: %v", err)
+        if resp != nil {
+            // Copy response headers and status code
+            copyHeaders(rw.Header(), resp.Header)
+            rw.WriteHeader(resp.StatusCode)
+        } else {
+            http.Error(rw, "Failed to connect to backend", http.StatusBadGateway)
+        }
+        return
+    }
+    defer backendConn.Close()
+
+    // Upgrade the client connection
+    upgrader := websocket.Upgrader{
+        HandshakeTimeout: b.DialTimeout,
+        ReadBufferSize:   1024,
+        WriteBufferSize:  1024,
+        CheckOrigin:      func(r *http.Request) bool { return true },
+    }
+
+    clientConn, err := upgrader.Upgrade(rw, req, nil)
+    if err != nil {
+        log.Printf("[ERROR] Failed to upgrade client connection: %v", err)
+        return
+    }
+    defer clientConn.Close()
+
+	// Create channels to coordinate connection closure
+	clientDone := make(chan struct{})
+	backendDone := make(chan struct{})
+
+	// Proxy client messages to backend
+	go func() {
+		defer close(clientDone)
+		for {
+			messageType, message, err := clientConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			err = backendConn.WriteMessage(messageType, message)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Proxy backend messages to client
+	go func() {
+		defer close(backendDone)
+		for {
+			messageType, message, err := backendConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			err = clientConn.WriteMessage(messageType, message)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for either connection to close
+	select {
+	case <-clientDone:
+	case <-backendDone:
+	}
+}
+
+func (b *Balancer) handleHTTP(rw http.ResponseWriter, req *http.Request, targetService string) {
 	// Create proxy request
-	targetURL := selectedService + req.URL.Path
+	targetURL := targetService + req.URL.Path
 	proxyReq, err := http.NewRequest(req.Method, targetURL, req.Body)
 	if err != nil {
 		log.Printf("[ERROR] Failed to create proxy request to %s: %v", targetURL, err)
@@ -173,7 +289,7 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	// Copy headers and metadata
-	proxyReq.Header = req.Header.Clone()
+	copyHeaders(proxyReq.Header, req.Header)
 	proxyReq.Host = req.Host
 	proxyReq.URL.RawQuery = req.URL.RawQuery
 
@@ -190,16 +306,20 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Success log
 	log.Printf("[INFO] Successfully proxied request to %s with status %d", targetURL, resp.StatusCode)
 
-	// Copy response headers
-	for k, v := range resp.Header {
-		for _, val := range v {
-			rw.Header().Add(k, val)
-		}
-	}
-
-	// Write status code and body
+	// Copy response headers and status code
+	copyHeaders(rw.Header(), resp.Header)
 	rw.WriteHeader(resp.StatusCode)
+
+	// Copy response body
 	if _, err := io.Copy(rw, resp.Body); err != nil {
 		log.Printf("[ERROR] Failed to write response body from %s: %v", targetURL, err)
+	}
+}
+
+func copyHeaders(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
 	}
 }

@@ -17,7 +17,7 @@ var (
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout: 2 * time.Second,
 	}
 	
 	// Connection counters
@@ -91,7 +91,7 @@ func main() {
 
 	// Start balancer
 	config := traefikwsbalancer.CreateConfig()
-	config.Pods = []string{
+	config.Services = []string{
 		"http://localhost:8081",
 		"http://localhost:8082",
 	}

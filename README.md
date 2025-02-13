@@ -78,7 +78,7 @@ The balancer consists of three main components:
 ```go
 type Config struct {
     MetricPath    string        // Path to fetch connection metrics
-    Pods          []string      // List of backend pod URLs
+    services          []string      // List of backend pod URLs
     TLSVerify     bool         // Enable/disable TLS verification
     CacheTTL      time.Duration // Metrics cache duration
     DialTimeout   time.Duration // WebSocket connection timeout
