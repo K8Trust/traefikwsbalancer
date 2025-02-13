@@ -205,6 +205,8 @@ log.SetFlags(log.Lshortfile | log.Ltime | log.Lmicroseconds)
 4. Push to the branch
 5. Create a Pull Request
 
+![Alt text](image.png)
+
 ## License
 
 MIT License
