@@ -11,22 +11,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/K8Trust/traefikwsbalancer/ws"
 )
 
-// ConnectionFetcher interface for getting connection counts
+// ConnectionFetcher interface for getting connection counts.
 type ConnectionFetcher interface {
 	GetConnections(string) (int, error)
 }
 
-// Config represents the plugin configuration
+// Config represents the plugin configuration.
 type Config struct {
 	MetricPath string   `json:"metricPath,omitempty" yaml:"metricPath"`
 	Services   []string `json:"services,omitempty" yaml:"services"`
 	CacheTTL   int      `json:"cacheTTL" yaml:"cacheTTL"` // TTL in seconds
 }
 
-// CreateConfig creates the default plugin configuration
+// CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
 		MetricPath: "/metric",
@@ -34,7 +34,7 @@ func CreateConfig() *Config {
 	}
 }
 
-// Balancer is the connection balancer plugin
+// Balancer is the connection balancer plugin.
 type Balancer struct {
 	Next         http.Handler
 	Name         string
@@ -46,14 +46,14 @@ type Balancer struct {
 	WriteTimeout time.Duration
 	ReadTimeout  time.Duration
 
-	// Connection caching
-	connCache    sync.Map
-	cacheTTL     time.Duration
-	lastUpdate   time.Time
-	updateMutex  sync.Mutex
+	// Connection caching.
+	connCache   sync.Map
+	cacheTTL    time.Duration
+	lastUpdate  time.Time
+	updateMutex sync.Mutex
 }
 
-// New creates a new plugin instance
+// New creates a new plugin instance.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	if len(config.Services) == 0 {
 		return nil, fmt.Errorf("no services configured")
@@ -77,7 +77,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}, nil
 }
 
-// GetConnections retrieves the number of connections for a service
+// GetConnections retrieves the number of connections for a service.
 func (b *Balancer) GetConnections(service string) (int, error) {
 	if b.Fetcher != nil {
 		log.Printf("[DEBUG] Using custom connection fetcher for service %s", service)
@@ -129,21 +129,21 @@ func (b *Balancer) getCachedConnections(service string) (int, error) {
 }
 
 func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// Select service with least connections
+	// Select service with least connections.
 	minConnections := int(^uint(0) >> 1)
 	var selectedService string
-	
+
 	log.Printf("[DEBUG] Request received: %s %s", req.Method, req.URL.Path)
 	log.Printf("[DEBUG] Checking connection counts across services:")
 	allServiceConnections := make(map[string]int)
-	
+
 	for _, service := range b.Services {
 		connections, err := b.getCachedConnections(service)
 		if err != nil {
 			log.Printf("[ERROR] Failed to get connections for service %s: %v", service, err)
 			continue
 		}
-		
+
 		allServiceConnections[service] = connections
 		log.Printf("[DEBUG] Service %s has %d active connections", service, connections)
 
@@ -153,95 +153,93 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			log.Printf("[DEBUG] New minimum found: service %s with %d connections", service, connections)
 		}
 	}
-	
+
 	if selectedService == "" {
 		log.Printf("[ERROR] No available services found")
 		http.Error(rw, "No available service", http.StatusServiceUnavailable)
 		return
 	}
 
-	log.Printf("[INFO] Selected service %s with %d connections (lowest) for request %s. Connection counts: %v", 
-		selectedService, 
+	log.Printf("[INFO] Selected service %s with %d connections (lowest) for request %s. Connection counts: %v",
+		selectedService,
 		allServiceConnections[selectedService],
 		req.URL.Path,
 		allServiceConnections)
 
-	// Check if this is a WebSocket upgrade request
-	if websocket.IsWebSocketUpgrade(req) {
+	// Check if this is a WebSocket upgrade request.
+	if ws.IsWebSocketUpgrade(req) {
 		log.Printf("[DEBUG] Handling WebSocket upgrade request")
 		b.handleWebSocket(rw, req, selectedService)
 		return
 	}
 
-	// Handle regular HTTP request
+	// Handle regular HTTP request.
 	b.handleHTTP(rw, req, selectedService)
 }
 
 func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, targetService string) {
-    // Configure dialer with timeouts
-    dialer := websocket.Dialer{
-        HandshakeTimeout: b.DialTimeout,
-        ReadBufferSize:   1024,
-        WriteBufferSize:  1024,
-    }
+	// Configure dialer with timeouts.
+	dialer := ws.Dialer{
+		HandshakeTimeout: b.DialTimeout,
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
+	}
 
-    // Create target URL for the backend service
-    targetURL := "ws" + strings.TrimPrefix(targetService, "http") + req.URL.Path
-    if req.URL.RawQuery != "" {
-        targetURL += "?" + req.URL.RawQuery
-    }
+	// Create target URL for the backend service.
+	targetURL := "ws" + strings.TrimPrefix(targetService, "http") + req.URL.Path
+	if req.URL.RawQuery != "" {
+		targetURL += "?" + req.URL.RawQuery
+	}
 
-    log.Printf("[DEBUG] Dialing backend WebSocket service at %s", targetURL)
+	log.Printf("[DEBUG] Dialing backend WebSocket service at %s", targetURL)
 
-    // Clean headers for backend connection
-    cleanHeaders := make(http.Header)
-    for k, v := range req.Header {
-        switch k {
-        case "Upgrade", "Connection", "Sec-Websocket-Key",
-             "Sec-Websocket-Version", "Sec-Websocket-Extensions",
-             "Sec-Websocket-Protocol":
-            // Skip WebSocket-specific headers
-            continue
-        default:
-            cleanHeaders[k] = v
-        }
-    }
+	// Clean headers for backend connection.
+	cleanHeaders := make(http.Header)
+	for k, v := range req.Header {
+		switch k {
+		case "Upgrade", "Connection", "Sec-Websocket-Key",
+			"Sec-Websocket-Version", "Sec-Websocket-Extensions",
+			"Sec-Websocket-Protocol":
+			continue
+		default:
+			cleanHeaders[k] = v
+		}
+	}
 
-    // Connect to the backend
-    backendConn, resp, err := dialer.Dial(targetURL, cleanHeaders)
-    if err != nil {
-        log.Printf("[ERROR] Failed to connect to backend WebSocket: %v", err)
-        if resp != nil {
-            // Copy response headers and status code
-            copyHeaders(rw.Header(), resp.Header)
-            rw.WriteHeader(resp.StatusCode)
-        } else {
-            http.Error(rw, "Failed to connect to backend", http.StatusBadGateway)
-        }
-        return
-    }
-    defer backendConn.Close()
+	// Connect to the backend.
+	backendConn, resp, err := dialer.Dial(targetURL, cleanHeaders)
+	if err != nil {
+		log.Printf("[ERROR] Failed to connect to backend WebSocket: %v", err)
+		if resp != nil {
+			copyHeaders(rw.Header(), resp.Header)
+			rw.WriteHeader(resp.StatusCode)
+		} else {
+			http.Error(rw, "Failed to connect to backend", http.StatusBadGateway)
+		}
+		return
+	}
+	defer backendConn.Close()
 
-    // Upgrade the client connection
-    upgrader := websocket.Upgrader{
-        HandshakeTimeout: b.DialTimeout,
-        ReadBufferSize:   1024,
-        WriteBufferSize:  1024,
-        CheckOrigin:      func(r *http.Request) bool { return true },
-    }
+	// Upgrade the client connection.
+	upgrader := ws.Upgrader{
+		HandshakeTimeout: b.DialTimeout,
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
+		CheckOrigin:      func(r *http.Request) bool { return true },
+	}
 
-    clientConn, err := upgrader.Upgrade(rw, req, nil)
-    if err != nil {
-        log.Printf("[ERROR] Failed to upgrade client connection: %v", err)
-        return
-    }
-    defer clientConn.Close()
+	clientConn, err := upgrader.Upgrade(rw, req, nil)
+	if err != nil {
+		log.Printf("[ERROR] Failed to upgrade client connection: %v", err)
+		return
+	}
+	defer clientConn.Close()
 
-	// Create channels to coordinate connection closure
+	// Create channels to coordinate connection closure.
 	clientDone := make(chan struct{})
 	backendDone := make(chan struct{})
 
-	// Proxy client messages to backend
+	// Proxy client messages to backend.
 	go func() {
 		defer close(clientDone)
 		for {
@@ -256,7 +254,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 		}
 	}()
 
-	// Proxy backend messages to client
+	// Proxy backend messages to client.
 	go func() {
 		defer close(backendDone)
 		for {
@@ -271,7 +269,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 		}
 	}()
 
-	// Wait for either connection to close
+	// Wait for either connection to close.
 	select {
 	case <-clientDone:
 	case <-backendDone:
@@ -279,7 +277,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 }
 
 func (b *Balancer) handleHTTP(rw http.ResponseWriter, req *http.Request, targetService string) {
-	// Create proxy request
+	// Create proxy request.
 	targetURL := targetService + req.URL.Path
 	proxyReq, err := http.NewRequest(req.Method, targetURL, req.Body)
 	if err != nil {
@@ -288,12 +286,10 @@ func (b *Balancer) handleHTTP(rw http.ResponseWriter, req *http.Request, targetS
 		return
 	}
 
-	// Copy headers and metadata
 	copyHeaders(proxyReq.Header, req.Header)
 	proxyReq.Host = req.Host
 	proxyReq.URL.RawQuery = req.URL.RawQuery
 
-	// Forward the request
 	log.Printf("[DEBUG] Forwarding request to %s", targetURL)
 	resp, err := b.Client.Do(proxyReq)
 	if err != nil {
@@ -303,14 +299,11 @@ func (b *Balancer) handleHTTP(rw http.ResponseWriter, req *http.Request, targetS
 	}
 	defer resp.Body.Close()
 
-	// Success log
 	log.Printf("[INFO] Successfully proxied request to %s with status %d", targetURL, resp.StatusCode)
 
-	// Copy response headers and status code
 	copyHeaders(rw.Header(), resp.Header)
 	rw.WriteHeader(resp.StatusCode)
 
-	// Copy response body
 	if _, err := io.Copy(rw, resp.Body); err != nil {
 		log.Printf("[ERROR] Failed to write response body from %s: %v", targetURL, err)
 	}

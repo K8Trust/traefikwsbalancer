@@ -8,19 +8,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/K8Trust/traefikwsbalancer"
+	"github.com/K8Trust/traefikwsbalancer/ws"
 )
 
 var (
-	upgrader = websocket.Upgrader{
+	upgrader = ws.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
 		HandshakeTimeout: 2 * time.Second,
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
 	}
-	
-	// Connection counters
+
 	connections1 uint32
 	connections2 uint32
 )
@@ -28,8 +29,8 @@ var (
 func wsHandler(counter *uint32) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddUint32(counter, 1)
-		defer atomic.AddUint32(counter, ^uint32(0)) // Decrement on disconnect
-		
+		defer atomic.AddUint32(counter, ^uint32(0)) // decrement
+
 		c, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("Backend upgrade error: %v", err)
@@ -38,7 +39,7 @@ func wsHandler(counter *uint32) http.HandlerFunc {
 		defer c.Close()
 
 		log.Printf("Backend WebSocket connection established")
-		
+
 		for {
 			mt, message, err := c.ReadMessage()
 			if err != nil {
@@ -65,7 +66,7 @@ func metricsHandler(counter *uint32) http.HandlerFunc {
 }
 
 func main() {
-	// Start backend servers
+	// Start backend server 1.
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/ws", wsHandler(&connections1))
@@ -76,6 +77,7 @@ func main() {
 		}
 	}()
 
+	// Start backend server 2.
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/ws", wsHandler(&connections2))
@@ -86,21 +88,20 @@ func main() {
 		}
 	}()
 
-	// Give backends time to start
+	// Allow backends to start.
 	time.Sleep(time.Second)
 
-	// Start balancer
 	config := traefikwsbalancer.CreateConfig()
 	config.Services = []string{
 		"http://localhost:8081",
 		"http://localhost:8082",
 	}
-	
+
 	balancer, err := traefikwsbalancer.New(context.Background(), nil, config, "")
 	if err != nil {
 		log.Fatal(err)
 	}
-	
+
 	http.Handle("/", balancer)
 	log.Printf("Starting balancer on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
