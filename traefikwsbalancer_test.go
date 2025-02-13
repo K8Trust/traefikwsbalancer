@@ -47,7 +47,7 @@ func TestGetConnections(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cb := &traefikwsbalancer.WSBalancer{
+			cb := &traefikwsbalancer.Balancer{
 				Client:     &http.Client{Timeout: 5 * time.Second},
 				MetricPath: "/metric",
 				Fetcher: &MockFetcher{
@@ -61,7 +61,7 @@ func TestGetConnections(t *testing.T) {
 			}))
 			defer server.Close()
 
-			connections, err := cb.Fetcher.GetConnections(server.URL)
+			connections, err := cb.GetConnections(server.URL)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetConnections() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -111,13 +111,13 @@ func TestWebSocketConnection(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	cb := &traefikwsbalancer.WSBalancer{
+	cb := &traefikwsbalancer.Balancer{
 		Client: &http.Client{},
 		Fetcher: &MockFetcher{
 			MockURL:     backendServer.URL,
 			Connections: 1,
 		},
-		Pods:         []string{backendServer.URL},
+		Services:     []string{backendServer.URL},
 		DialTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		ReadTimeout:  30 * time.Second,
