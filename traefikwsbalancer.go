@@ -16,6 +16,12 @@ import (
     "github.com/K8Trust/traefikwsbalancer/ws"
 )
 
+// Version information. These will be set during build time.
+var (
+    Version   = "dev"     // Will be set to git tag/commit during build
+    BuildTime = "unknown" // Will be set to current time during build
+)
+
 type ConnectionFetcher interface {
     GetConnections(string) (int, error)
 }
@@ -52,8 +58,18 @@ type Balancer struct {
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+    log.Printf("[INFO] ============= Initializing TraefikWSBalancer Plugin =============")
+    log.Printf("[INFO] Version: %s", Version)
+    log.Printf("[INFO] Build Time: %s", BuildTime)
+    log.Printf("[INFO] Config: %+v", config)
+
     if len(config.Services) == 0 {
         return nil, fmt.Errorf("no services configured")
+    }
+
+    log.Printf("[INFO] Configured Services:")
+    for i, service := range config.Services {
+        log.Printf("[INFO]   %d. %s", i+1, service)
     }
 
     b := &Balancer{
