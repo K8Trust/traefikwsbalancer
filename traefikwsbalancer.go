@@ -168,15 +168,14 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
     // Clean headers for backend connection
     cleanHeaders := make(http.Header)
     for k, v := range req.Header {
-        switch k {
-        case "Upgrade", "Connection", "Sec-Websocket-Key",
-            "Sec-Websocket-Version", "Sec-Websocket-Extensions",
-            "Sec-Websocket-Protocol":
-            continue
-        default:
-            cleanHeaders[k] = v
-        }
+        cleanHeaders[k] = v
     }
+    // Ensure required WebSocket headers are present
+    cleanHeaders.Set("Upgrade", "websocket")
+    cleanHeaders.Set("Connection", "Upgrade")
+    if protocol := req.Header.Get("Sec-WebSocket-Protocol"); protocol != "" {
+        cleanHeaders.Set("Sec-WebSocket-Protocol", protocol)
+}
 
     // Connect to the backend with retries
     var backendConn *ws.Conn
