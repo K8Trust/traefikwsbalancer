@@ -8,6 +8,7 @@ import (
     "log"
     "net/http"
     "sync/atomic"
+    "time"  // Added missing import
 
     "github.com/K8Trust/traefikwsbalancer/ws"
 )
@@ -38,18 +39,7 @@ func main() {
     mux := http.NewServeMux()
     mux.HandleFunc("/ws", handleWebSocket)
     mux.HandleFunc("/metric", handleMetrics)
-    mux.HandleFunc("/health", handleHealth)
-
-    // Add counter reset endpoint
-    mux.HandleFunc("/reset", func(w http.ResponseWriter, r *http.Request) {
-        if r.Method == "POST" {
-            old := activeConnections.Swap(0)
-            log.Printf("[INFO] Counter reset. Old value: %d", old)
-            w.WriteHeader(http.StatusOK)
-            return
-        }
-        w.WriteHeader(http.StatusMethodNotAllowed)
-    })
+    mux.HandleFunc("/health", handleHealth)  // Added health endpoint
 
     addr := fmt.Sprintf(":%d", port)
     log.Printf("Starting test server on %s", addr)
@@ -57,57 +47,52 @@ func main() {
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-    log.Printf("[DEBUG] Received WebSocket connection request")
-    
     upgrader := ws.Upgrader{
-        CheckOrigin: func(r *http.Request) bool { 
-            log.Printf("[DEBUG] Checking origin: %v", r.Header.Get("Origin"))
-            return true 
-        },
+        CheckOrigin: func(r *http.Request) bool { return true },
     }
 
     conn, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
-        log.Printf("[ERROR] Upgrade failed: %v", err)
+        log.Printf("Upgrade failed: %v", err)
         return
     }
-    
-    currentConns := activeConnections.Add(1)
-    log.Printf("[INFO] New WebSocket connection. Current active: %d", currentConns)
-    
-    defer func() {
-        conn.Close()
-        currentConns := activeConnections.Add(-1)
-        log.Printf("[INFO] Connection closed. Current active: %d", currentConns)
-    }()
+    defer conn.Close()
+
+    activeConnections.Add(1)
+    defer activeConnections.Add(-1)
+
+    log.Printf("New WebSocket connection. Total active: %d", activeConnections.Load())
 
     for {
         messageType, message, err := conn.ReadMessage()
         if err != nil {
-            log.Printf("[DEBUG] Read error (normal on client disconnect): %v", err)
+            log.Printf("Read error: %v", err)
             break
         }
 
-        log.Printf("[DEBUG] Received message: %s", message)
+        log.Printf("Received: %s", message)
 
         err = conn.WriteMessage(messageType, message)
         if err != nil {
-            log.Printf("[ERROR] Write error: %v", err)
+            log.Printf("Write error: %v", err)
             break
         }
     }
 }
 
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
-    current := activeConnections.Load()
-    log.Printf("[DEBUG] Metrics request. Current connections: %d", current)
-    
     metrics := struct {
         AgentsConnections int64 `json:"agentsConnections"`
     }{
-        AgentsConnections: current,
+        AgentsConnections: activeConnections.Load(),
     }
 
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(metrics)
+}
+
+// Added missing health check handler
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+    w.Write([]byte("OK"))
 }
