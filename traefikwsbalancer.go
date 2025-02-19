@@ -146,6 +146,9 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, targetService string) {
+    log.Printf("[DEBUG] Handling WebSocket request for %s", req.URL.Path)
+    log.Printf("[DEBUG] Request headers: %v", req.Header)
+
     // Track connection
     b.trackConnection(targetService, 1)
     defer b.trackConnection(targetService, -1)
@@ -165,17 +168,20 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 
     log.Printf("[DEBUG] Dialing backend WebSocket service at %s", targetURL)
 
-    // Clean headers for backend connection
+    // Preserve and forward all headers
     cleanHeaders := make(http.Header)
     for k, v := range req.Header {
         cleanHeaders[k] = v
     }
-    // Ensure required WebSocket headers are present
+    
+    // Ensure required WebSocket headers
     cleanHeaders.Set("Upgrade", "websocket")
     cleanHeaders.Set("Connection", "Upgrade")
     if protocol := req.Header.Get("Sec-WebSocket-Protocol"); protocol != "" {
         cleanHeaders.Set("Sec-WebSocket-Protocol", protocol)
-}
+    }
+
+    log.Printf("[DEBUG] Forwarding headers: %v", cleanHeaders)
 
     // Connect to the backend with retries
     var backendConn *ws.Conn
@@ -188,6 +194,9 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
             break
         }
         log.Printf("[WARN] Retry %d: Failed to connect to backend: %v", retries+1, err)
+        if resp != nil {
+            log.Printf("[WARN] Response status: %d, headers: %v", resp.StatusCode, resp.Header)
+        }
         time.Sleep(time.Second * time.Duration(retries+1))
     }
 
@@ -196,6 +205,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
         if resp != nil {
             copyHeaders(rw.Header(), resp.Header)
             rw.WriteHeader(resp.StatusCode)
+            io.Copy(rw, resp.Body)
         } else {
             http.Error(rw, "Service Unavailable", http.StatusServiceUnavailable)
         }
@@ -218,34 +228,46 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
     }
     defer clientConn.Close()
 
-    errChan := make(chan error, 2)
+    log.Printf("[INFO] Successfully established WebSocket connection")
 
-    // Proxy client messages to backend
+    errChan := make(chan error, 2)
+    
+    // Proxy client messages to backend with timeout
     go func() {
         for {
             messageType, message, err := clientConn.ReadMessage()
             if err != nil {
+                log.Printf("[DEBUG] Client read error: %v", err)
                 errChan <- err
                 return
             }
+            
+            // Set write deadline for backend
+            backendConn.SetWriteDeadline(time.Now().Add(b.WriteTimeout))
             err = backendConn.WriteMessage(messageType, message)
             if err != nil {
+                log.Printf("[DEBUG] Backend write error: %v", err)
                 errChan <- err
                 return
             }
         }
     }()
 
-    // Proxy backend messages to client
+    // Proxy backend messages to client with timeout
     go func() {
         for {
             messageType, message, err := backendConn.ReadMessage()
             if err != nil {
+                log.Printf("[DEBUG] Backend read error: %v", err)
                 errChan <- err
                 return
             }
+            
+            // Set write deadline for client
+            clientConn.SetWriteDeadline(time.Now().Add(b.WriteTimeout))
             err = clientConn.WriteMessage(messageType, message)
             if err != nil {
+                log.Printf("[DEBUG] Client write error: %v", err)
                 errChan <- err
                 return
             }
