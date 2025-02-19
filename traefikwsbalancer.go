@@ -169,8 +169,8 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
     log.Printf("[DEBUG] ============= WebSocket Handling Start =============")
     log.Printf("[DEBUG] Target Service: %s", targetService)
     log.Printf("[DEBUG] Original Headers:")
-    for key, values := range req.Header {
-        log.Printf("[DEBUG]   %s: %v", key, values)
+    for k, v := range req.Header {
+        log.Printf("[DEBUG] %s: %v", k, v)
     }
 
     // Track connection
@@ -180,26 +180,31 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
     // Preserve and forward all headers
     cleanHeaders := make(http.Header)
     for k, v := range req.Header {
-        // Special handling for auth and websocket headers
+        // Preserve headers based on type
         switch strings.ToLower(k) {
-        case "upgrade", "connection", "sec-websocket-key",
-            "sec-websocket-version", "sec-websocket-protocol":
-            // Skip these as they'll be handled by the websocket client
-            continue
         case "authorization", "agent-id", "x-account":
-            // Always forward authentication headers
+            // Always preserve auth headers exactly
             cleanHeaders[k] = v
+            log.Printf("[DEBUG] Preserving auth header: %s = %v", k, v)
+        case "sec-websocket-key":
+            // Don't modify the WebSocket key
+            cleanHeaders[k] = v
+        case "upgrade", "connection", "sec-websocket-version", "sec-websocket-protocol":
+            // Skip these as they'll be handled by the dialer
+            continue
         default:
             cleanHeaders[k] = v
         }
     }
 
-    // Ensure required WebSocket headers
+    // Ensure WebSocket headers are present
     cleanHeaders.Set("Upgrade", "websocket")
     cleanHeaders.Set("Connection", "Upgrade")
-    cleanHeaders.Set("Sec-WebSocket-Version", "13")
+    if cleanHeaders.Get("Sec-WebSocket-Version") == "" {
+        cleanHeaders.Set("Sec-WebSocket-Version", "13")
+    }
 
-    log.Printf("[DEBUG] Forwarding headers: %v", cleanHeaders)
+    log.Printf("[DEBUG] Final headers for backend connection: %+v", cleanHeaders)
 
     // Create target URL for the backend service
     targetURL := "ws" + strings.TrimPrefix(targetService, "http") + req.URL.Path
@@ -226,6 +231,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
         log.Printf("[DEBUG] Connection attempt %d to %s", retries+1, targetURL)
         backendConn, resp, err = dialer.Dial(targetURL, cleanHeaders)
         if err == nil {
+            log.Printf("[DEBUG] Backend connection successful")
             break
         }
 
@@ -234,7 +240,8 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
             body, _ := io.ReadAll(resp.Body)
             log.Printf("[WARN] Response status: %d, body: %s, headers: %v",
                 resp.StatusCode, string(body), resp.Header)
-            
+            resp.Body.Close()
+
             // Forward error response on last retry
             if retries == 2 {
                 for k, v := range resp.Header {
@@ -245,7 +252,6 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
                 rw.WriteHeader(resp.StatusCode)
                 rw.Write(body)
             }
-            resp.Body.Close()
         }
         time.Sleep(time.Second * time.Duration(retries+1))
     }
@@ -266,9 +272,6 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
     }
     defer backendConn.Close()
 
-    log.Printf("[DEBUG] Attempting to upgrade client connection...")
-    log.Printf("[DEBUG] Client headers: %+v", req.Header)
-
     // Upgrade the client connection
     upgrader := ws.Upgrader{
         HandshakeTimeout: b.DialTimeout,
@@ -280,6 +283,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
         },
     }
 
+    log.Printf("[DEBUG] Attempting to upgrade client connection...")
     clientConn, err := upgrader.Upgrade(rw, req, nil)
     if err != nil {
         log.Printf("[ERROR] Failed to upgrade client connection: %v", err)
@@ -319,7 +323,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
                     return
                 }
 
-                log.Printf("[TRACE] Client -> Backend: message type %d, size %d bytes",
+                log.Printf("[TRACE] Client -> Backend: type=%d, size=%d bytes", 
                     messageType, len(message))
 
                 backendConn.SetWriteDeadline(time.Now().Add(b.WriteTimeout))
@@ -351,7 +355,7 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
                     return
                 }
 
-                log.Printf("[TRACE] Backend -> Client: message type %d, size %d bytes",
+                log.Printf("[TRACE] Backend -> Client: type=%d, size=%d bytes", 
                     messageType, len(message))
 
                 clientConn.SetWriteDeadline(time.Now().Add(b.WriteTimeout))
