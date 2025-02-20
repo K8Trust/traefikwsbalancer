@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/K8Trust/traefikwsbalancer/ws"
 )
 
@@ -21,34 +20,10 @@ var (
 	BuildTime = "unknown"
 )
 
-// Metrics
-var (
-	activeConnections = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "wsbalancer_active_connections",
-			Help: "Number of active WebSocket connections per service",
-		},
-		[]string{"service"},
-	)
+// Note: The metrics variables (activeConnections, connectionDuration, connectionErrors)
+// are defined in separate files depending on build tag.
 
-	connectionDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "wsbalancer_connection_duration_seconds",
-			Help:    "Duration of WebSocket connections",
-			Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
-		},
-		[]string{"service"},
-	)
-
-	connectionErrors = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "wsbalancer_connection_errors_total",
-			Help: "Total number of WebSocket connection errors",
-		},
-		[]string{"service", "error_type"},
-	)
-)
-
+// A package-level sync.Once variable to ensure metrics are registered only once.
 var registerMetricsOnce sync.Once
 
 // CircuitBreaker handles service health monitoring
@@ -79,11 +54,11 @@ type ConnectionPoolConfig struct {
 }
 
 type Config struct {
-	MetricPath     string              `json:"metricPath,omitempty" yaml:"metricPath"`
-	Services       []string            `json:"services,omitempty" yaml:"services"`
-	CacheTTL       int                 `json:"cacheTTL" yaml:"cacheTTL"`
-	MaxRetries     int                 `json:"maxRetries" yaml:"maxRetries"`
-	RetryBackoff   time.Duration       `json:"retryBackoff" yaml:"retryBackoff"`
+	MetricPath     string               `json:"metricPath,omitempty" yaml:"metricPath"`
+	Services       []string             `json:"services,omitempty" yaml:"services"`
+	CacheTTL       int                  `json:"cacheTTL" yaml:"cacheTTL"`
+	MaxRetries     int                  `json:"maxRetries" yaml:"maxRetries"`
+	RetryBackoff   time.Duration        `json:"retryBackoff" yaml:"retryBackoff"`
 	CircuitBreaker CircuitBreakerConfig `json:"circuitBreaker" yaml:"circuitBreaker"`
 	ConnectionPool ConnectionPoolConfig  `json:"connectionPool" yaml:"connectionPool"`
 }
@@ -209,13 +184,20 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	registerMetricsOnce.Do(func() {
-		prometheus.MustRegister(activeConnections, connectionDuration, connectionErrors)
+		// Under non-yaegi builds this registers real Prometheus collectors.
+		// Under yaegi builds, the dummy MustRegister does nothing.
+		MustRegister(activeConnections, connectionDuration, connectionErrors)
 	})
 
 	return b, nil
 }
 
-// The remainder of the code remains unchanged
+// ---------------------------------------------------------------------
+// The remainder of the code implements service selection,
+// request handling (both HTTP and WebSocket), and bidirectional forwarding.
+// For brevity, they remain unchanged from the previous version.
+// (See the detailed explanation for each function.)
+// ---------------------------------------------------------------------
 
 func (b *Balancer) selectService() (string, error) {
 	var selectedService string
