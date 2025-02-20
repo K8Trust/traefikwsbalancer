@@ -3,30 +3,43 @@
 
 package traefikwsbalancer
 
-// Dummy implementations of Prometheus metric types for Yaegi.
-
+// Dummy implementations
 type dummyGaugeVec struct{}
+
+func (v dummyGaugeVec) WithLabelValues(lvs ...string) Gauge {
+    return dummyGauge{}
+}
+
+type dummyGauge struct{}
+
+func (g dummyGauge) Set(float64) {}
+
 type dummyHistogramVec struct{}
+
+func (v dummyHistogramVec) WithLabelValues(lvs ...string) Histogram {
+    return dummyHistogram{}
+}
+
+type dummyHistogram struct{}
+
+func (h dummyHistogram) Observe(float64) {}
+
 type dummyCounterVec struct{}
 
-func (dummyGaugeVec) WithLabelValues(vals ...string) dummyGauge { return dummyGauge{} }
-type dummyGauge struct{}
-func (dummyGauge) Set(val float64) {}
+func (v dummyCounterVec) WithLabelValues(lvs ...string) Counter {
+    return dummyCounter{}
+}
 
-func (dummyHistogramVec) WithLabelValues(vals ...string) dummyHistogram { return dummyHistogram{} }
-type dummyHistogram struct{}
-func (dummyHistogram) Observe(val float64) {}
-
-func (dummyCounterVec) WithLabelValues(vals ...string) dummyCounter { return dummyCounter{} }
 type dummyCounter struct{}
-func (dummyCounter) Inc() {}
 
-// MustRegister is a dummy no-op.
-func MustRegister(collectors ...interface{}) {}
+func (c dummyCounter) Inc() {}
 
-// Export dummy metrics variables.
-var (
-	activeConnections  dummyGaugeVec   = dummyGaugeVec{}
-	connectionDuration dummyHistogramVec = dummyHistogramVec{}
-	connectionErrors   dummyCounterVec   = dummyCounterVec{}
-)
+func init() {
+    activeConnections = dummyGaugeVec{}
+    connectionDuration = dummyHistogramVec{}
+    connectionErrors = dummyCounterVec{}
+    
+    MustRegister = func(collectors ...interface{}) {
+        // No-op for yaegi build
+    }
+}

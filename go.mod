@@ -6,7 +6,10 @@ toolchain go1.23.5
 
 replace github.com/K8Trust/traefikwsbalancer => .
 
-require github.com/prometheus/client_golang v1.21.0
+require (
+	github.com/prometheus/client_golang v1.21.0
+	github.com/traefik/yaegi v0.16.1
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
