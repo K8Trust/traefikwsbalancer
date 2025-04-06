@@ -17,14 +17,19 @@ A high-performance WebSocket connection balancer middleware for Traefik that dis
   - Support for WebSocket extensions and subprotocols
 
 - **Advanced Configuration**
-  - Configurable metrics endpoint
+  - Configurable metrics endpoint for both backend services and the balancer
   - Adjustable timeouts (dial, read, write)
   - TLS/SSL verification options
   - Custom header forwarding
 
+- **Pod-Level Monitoring**
+  - Detailed metrics for individual pods
+  - Visualization of connection distribution across pods
+  - Enhanced debugging capabilities with pod identification
+
 - **Monitoring & Debugging**
   - Detailed logging of connection events
-  - Connection metrics exposure
+  - Connection metrics exposure through dedicated endpoint
   - Error tracking and reporting
   - Debug-friendly log messages
 
@@ -77,23 +82,131 @@ The balancer consists of three main components:
 
 ```go
 type Config struct {
-    MetricPath    string        // Path to fetch connection metrics
-    services          []string      // List of backend pod URLs
-    TLSVerify     bool         // Enable/disable TLS verification
-    CacheTTL      time.Duration // Metrics cache duration
-    DialTimeout   time.Duration // WebSocket connection timeout
-    WriteTimeout  time.Duration // Write operation timeout
-    ReadTimeout   time.Duration // Read operation timeout
+    MetricPath         string        // Path to fetch connection metrics from backends
+    BalancerMetricPath string        // Path to expose balancer's metrics
+    Services           []string      // List of backend pod URLs
+    TLSVerify          bool          // Enable/disable TLS verification
+    CacheTTL           int           // Metrics cache duration in seconds
 }
 ```
 
 ### Default Values
 - MetricPath: "/metric"
+- BalancerMetricPath: "/balancer-metrics"
 - TLSVerify: true
 - CacheTTL: 30 seconds
-- DialTimeout: 10 seconds
-- WriteTimeout: 10 seconds
-- ReadTimeout: 30 seconds
+- DialTimeout: 10 seconds (internal)
+- WriteTimeout: 10 seconds (internal)
+- ReadTimeout: 30 seconds (internal)
+
+## Backend Implementation
+
+### Implementing the Metrics Endpoint
+
+Each backend service must implement a `/metric` endpoint (or custom path configured in `metricPath`) that returns connection information. For pod-level metrics, the endpoint should include pod identification details.
+
+#### Example in Node.js/Express:
+
+```javascript
+app.get("/metric", (req, res) => {
+  res.json({
+    agentsConnections: activeConnections.size,  // Number of active connections
+    podName: process.env.POD_NAME,              // Pod name from Kubernetes
+    podIP: process.env.POD_IP,                  // Pod IP from Kubernetes
+    nodeName: process.env.NODE_NAME             // Node name from Kubernetes
+  });
+});
+```
+
+#### Example in TypeScript/Express:
+
+```typescript
+app.get("/metric", (_req: Request, res: Response) => {
+  res.json({
+    agentsConnections: agentsConnections.size,  // Number of active connections
+    podName: process.env.POD_NAME,              // Pod name from Kubernetes
+    podIP: process.env.POD_IP,                  // Pod IP from Kubernetes
+    nodeName: process.env.NODE_NAME             // Node name from Kubernetes
+  });
+});
+```
+
+#### Example in Go:
+
+```go
+http.HandleFunc("/metric", func(w http.ResponseWriter, r *http.Request) {
+    metrics := struct {
+        AgentsConnections int    `json:"agentsConnections"`
+        PodName           string `json:"podName,omitempty"`
+        PodIP             string `json:"podIP,omitempty"`
+        NodeName          string `json:"nodeName,omitempty"`
+    }{
+        AgentsConnections: activeConnections.Count(),
+        PodName:           os.Getenv("POD_NAME"),
+        PodIP:             os.Getenv("POD_IP"),
+        NodeName:          os.Getenv("NODE_NAME"),
+    }
+    
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(metrics)
+})
+```
+
+### Connection Tracking
+
+Your backend service should track active WebSocket connections. Here's a simple implementation in Node.js:
+
+```javascript
+// Track active connections
+const activeConnections = new Set();
+
+// WebSocket server setup
+const wss = new WebSocketServer({ server });
+
+wss.on('connection', (ws) => {
+  // Add connection to tracking
+  activeConnections.add(ws);
+  
+  ws.on('close', () => {
+    // Remove connection from tracking
+    activeConnections.delete(ws);
+  });
+});
+```
+
+## Metrics Endpoint
+
+The plugin provides a dedicated metrics endpoint that displays:
+- Current timestamp
+- List of services with their connection counts
+- Pod-level metrics showing connection counts per pod
+- Total connection count across all services
+
+### Example Metrics Response
+
+```json
+{
+  "timestamp": "2025-04-06T20:02:59Z",
+  "services": [
+    {
+      "url": "http://service-1.namespace.svc.cluster.local:80",
+      "connections": 42
+    }
+  ],
+  "podMetrics": {
+    "http://service-1.namespace.svc.cluster.local:80": [
+      {
+        "agentsConnections": 42,
+        "podName": "service-1-pod-abc123",
+        "podIP": "10.0.0.1",
+        "nodeName": "node-1"
+      }
+    ]
+  },
+  "totalConnections": 42,
+  "agentsConnections": 42
+}
+```
 
 ## Architecture
 
@@ -111,33 +224,6 @@ type Config struct {
 - Uses atomic operations for thread safety
 - Handles backend failures gracefully
 
-## Development
-
-### Project Structure
-```
-traefikwsbalancer/
-├── cmd/
-│   ├── test-client/
-│   │   └── main.go
-│   └── test-server/
-│       └── main.go
-├── traefikwsbalancer.go
-├── go.mod
-└── go.sum
-```
-
-### Testing
-
-The project includes several test types:
-- Unit tests for core functionality
-- Integration tests for WebSocket handling
-- Load tests for connection management
-
-Run tests:
-```bash
-go test ./...
-```
-
 ## Production Deployment
 
 ### Best Practices
@@ -152,23 +238,63 @@ go test ./...
    - Set appropriate buffer sizes
 
 3. **Monitoring**
-   - Log connection events
-   - Track metrics
+   - Use the dedicated metrics endpoint to monitor traffic distribution
+   - Track pod-level metrics to identify potential hotspots
    - Monitor backend health
 
-### Example Configuration
+### Example Configuration with Traefik
 
 ```yaml
-wsbalancer:
-  metricPath: "/metric"
-  pods:
-    - "http://backend1:8080"
-    - "http://backend2:8080"
-  tlsVerify: true
-  cacheTTL: "30s"
-  dialTimeout: "10s"
-  writeTimeout: "10s"
-  readTimeout: "30s"
+# Static configuration in the Traefik config file
+experimental:
+  plugins:
+    traefikwsbalancer:
+      moduleName: "github.com/K8Trust/traefikwsbalancer"
+      version: "v1.0.26"
+
+# Dynamic configuration (Kubernetes CRD)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: socket-balancer
+  namespace: default
+spec:
+  plugin:
+    traefikwsbalancer:
+      metricPath: "/metric"
+      balancerMetricPath: "/balancer-metrics"
+      services:
+        - "http://service-1.namespace.svc.cluster.local:80"
+      cacheTTL: 30
+```
+
+### Kubernetes Configuration
+
+For pod-level metrics to work, ensure your pods expose their identities via environment variables in your deployment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: websocket-service
+spec:
+  template:
+    spec:
+      containers:
+        - name: websocket-service
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
 ```
 
 ## Troubleshooting
@@ -181,7 +307,7 @@ wsbalancer:
    - Check TLS configuration
 
 2. **Performance Issues**
-   - Monitor connection counts
+   - Monitor connection counts via the metrics endpoint
    - Adjust cache TTL
    - Check backend resources
 
@@ -189,6 +315,16 @@ wsbalancer:
    - Verify WebSocket upgrade headers
    - Check protocol compatibility
    - Monitor message sizes
+
+4. **Missing Pod Metrics**
+   - Ensure pod environment variables are correctly set
+   - Verify backend metric endpoint returns pod information
+   - Check plugin logs for decoding errors
+
+5. **Endpoint Implementation Issues**
+   - Verify your backend's `/metric` endpoint returns valid JSON
+   - Check for proper formatting of the `agentsConnections` field
+   - Ensure connection tracking is accurately maintained
 
 ### Debugging
 
@@ -205,7 +341,7 @@ log.SetFlags(log.Lshortfile | log.Ltime | log.Lmicroseconds)
 4. Push to the branch
 5. Create a Pull Request
 
-![Alt text](image.png)
+![Traefik WebSocket Balancer Flow Diagram](image.png)
 
 ## License
 
