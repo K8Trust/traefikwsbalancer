@@ -21,30 +21,33 @@ type ConnectionFetcher interface {
 
 // Config represents the plugin configuration.
 type Config struct {
-	MetricPath string   `json:"metricPath,omitempty" yaml:"metricPath"`
-	Services   []string `json:"services,omitempty" yaml:"services"`
-	CacheTTL   int      `json:"cacheTTL" yaml:"cacheTTL"` // TTL in seconds
+	MetricPath        string   `json:"metricPath,omitempty" yaml:"metricPath"`
+	BalancerMetricPath string   `json:"balancerMetricPath,omitempty" yaml:"balancerMetricPath"`
+	Services          []string `json:"services,omitempty" yaml:"services"`
+	CacheTTL          int      `json:"cacheTTL" yaml:"cacheTTL"` // TTL in seconds
 }
 
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		MetricPath: "/metric",
-		CacheTTL:   30, // 30 seconds default
+		MetricPath:        "/metric",
+		BalancerMetricPath: "/balancer-metrics",
+		CacheTTL:          30, // 30 seconds default
 	}
 }
 
 // Balancer is the connection balancer plugin.
 type Balancer struct {
-	Next         http.Handler
-	Name         string
-	Services     []string
-	Client       *http.Client
-	MetricPath   string
-	Fetcher      ConnectionFetcher
-	DialTimeout  time.Duration
-	WriteTimeout time.Duration
-	ReadTimeout  time.Duration
+	Next              http.Handler
+	Name              string
+	Services          []string
+	Client            *http.Client
+	MetricPath        string
+	BalancerMetricPath string
+	Fetcher           ConnectionFetcher
+	DialTimeout       time.Duration
+	WriteTimeout      time.Duration
+	ReadTimeout       time.Duration
 
 	// Connection caching.
 	connCache   sync.Map
@@ -65,15 +68,16 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	return &Balancer{
-		Next:         next,
-		Name:         name,
-		Services:     config.Services,
-		Client:       &http.Client{Timeout: 5 * time.Second},
-		MetricPath:   config.MetricPath,
-		cacheTTL:     time.Duration(config.CacheTTL) * time.Second,
-		DialTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		ReadTimeout:  30 * time.Second,
+		Next:              next,
+		Name:              name,
+		Services:          config.Services,
+		Client:            &http.Client{Timeout: 5 * time.Second},
+		MetricPath:        config.MetricPath,
+		BalancerMetricPath: config.BalancerMetricPath,
+		cacheTTL:          time.Duration(config.CacheTTL) * time.Second,
+		DialTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		ReadTimeout:       30 * time.Second,
 	}, nil
 }
 
@@ -168,8 +172,8 @@ func (b *Balancer) GetAllCachedConnections() map[string]int {
 }
 
 func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	// Check if this is a request to our metrics endpoint
-	if req.URL.Path == b.MetricPath {
+	// Check if this is a request to our balancer metrics endpoint
+	if req.URL.Path == b.BalancerMetricPath {
 		b.handleMetricRequest(rw, req)
 		return
 	}
@@ -224,7 +228,7 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 // handleMetricRequest responds with current connection metrics for all backends
 func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request) {
-	log.Printf("[DEBUG] Handling metrics request")
+	log.Printf("[DEBUG] Handling balancer metrics request")
 	
 	// Get connection counts for all services
 	connections := b.GetAllCachedConnections()
@@ -236,9 +240,10 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 	}
 	
 	response := struct {
-		Timestamp  string          `json:"timestamp"`
-		Services   []ServiceMetric `json:"services"`
-		TotalCount int             `json:"totalConnections"`
+		Timestamp       string          `json:"timestamp"`
+		Services        []ServiceMetric `json:"services"`
+		TotalCount      int             `json:"totalConnections"`
+		AgentsConnections int           `json:"agentsConnections"` // For compatibility with backend metrics
 	}{
 		Timestamp: time.Now().Format(time.RFC3339),
 		Services:  make([]ServiceMetric, 0, len(connections)),
@@ -254,6 +259,7 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 		totalConnections += count
 	}
 	response.TotalCount = totalConnections
+	response.AgentsConnections = totalConnections // Match the expected format for compatibility
 	
 	// Return JSON response
 	rw.Header().Set("Content-Type", "application/json")
