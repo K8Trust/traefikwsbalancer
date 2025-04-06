@@ -134,7 +134,46 @@ func (b *Balancer) getCachedConnections(service string) (int, error) {
 	return 0, fmt.Errorf("no cached count for service %s", service)
 }
 
+// GetAllCachedConnections returns a map of all service connection counts
+func (b *Balancer) GetAllCachedConnections() map[string]int {
+	b.updateMutex.Lock()
+	defer b.updateMutex.Unlock()
+
+	// Refresh connection counts if cache has expired
+	if time.Since(b.lastUpdate) > b.cacheTTL {
+		log.Printf("[DEBUG] Cache TTL expired, refreshing connection counts")
+		for _, s := range b.Services {
+			count, err := b.GetConnections(s)
+			if err != nil {
+				log.Printf("[ERROR] Error fetching connections for service %s: %v", s, err)
+				continue
+			}
+			b.connCache.Store(s, count)
+			log.Printf("[DEBUG] Updated cached connections for service %s: %d", s, count)
+		}
+		b.lastUpdate = time.Now()
+	}
+
+	// Build a map of all service connection counts
+	connections := make(map[string]int)
+	for _, service := range b.Services {
+		if count, ok := b.connCache.Load(service); ok {
+			connections[service] = count.(int)
+		} else {
+			connections[service] = 0
+		}
+	}
+
+	return connections
+}
+
 func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Check if this is a request to our metrics endpoint
+	if req.URL.Path == b.MetricPath {
+		b.handleMetricRequest(rw, req)
+		return
+	}
+
 	// Select service with least connections.
 	minConnections := int(^uint(0) >> 1)
 	var selectedService string
@@ -181,6 +220,48 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// Handle regular HTTP request.
 	b.handleHTTP(rw, req, selectedService)
+}
+
+// handleMetricRequest responds with current connection metrics for all backends
+func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request) {
+	log.Printf("[DEBUG] Handling metrics request")
+	
+	// Get connection counts for all services
+	connections := b.GetAllCachedConnections()
+	
+	// Create response structure
+	type ServiceMetric struct {
+		URL         string `json:"url"`
+		Connections int    `json:"connections"`
+	}
+	
+	response := struct {
+		Timestamp  string          `json:"timestamp"`
+		Services   []ServiceMetric `json:"services"`
+		TotalCount int             `json:"totalConnections"`
+	}{
+		Timestamp: time.Now().Format(time.RFC3339),
+		Services:  make([]ServiceMetric, 0, len(connections)),
+	}
+	
+	// Fill the response
+	totalConnections := 0
+	for service, count := range connections {
+		response.Services = append(response.Services, ServiceMetric{
+			URL:         service,
+			Connections: count,
+		})
+		totalConnections += count
+	}
+	response.TotalCount = totalConnections
+	
+	// Return JSON response
+	rw.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(rw).Encode(response); err != nil {
+		log.Printf("[ERROR] Failed to encode metrics response: %v", err)
+		http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 }
 
 func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, targetService string) {
