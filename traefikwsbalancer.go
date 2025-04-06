@@ -119,6 +119,12 @@ func (b *Balancer) getCachedConnections(service string) (int, error) {
 			b.connCache.Store(s, count)
 			log.Printf("[DEBUG] Updated cached connections for service %s: %d", s, count)
 		}
+		// Log the current connection counts for all backends
+		for _, s := range b.Services {
+			if val, ok := b.connCache.Load(s); ok {
+				log.Printf("[DEBUG] Cached connection count for backend %s: %d", s, val.(int))
+			}
+		}
 		b.lastUpdate = time.Now()
 	}
 
