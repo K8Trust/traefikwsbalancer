@@ -14,7 +14,34 @@ import (
 
 	"github.com/K8Trust/traefikwsbalancer/internal/dashboard"
 	"github.com/K8Trust/traefikwsbalancer/ws"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
+
+// K8sClient handles Kubernetes API calls
+type K8sClient struct {
+	clientset *kubernetes.Clientset
+}
+
+// NewK8sClient creates a new Kubernetes client using in-cluster config
+func NewK8sClient() (*K8sClient, error) {
+	// Create in-cluster config
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create in-cluster config: %v", err)
+	}
+
+	// Create clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %v", err)
+	}
+
+	return &K8sClient{
+		clientset: clientset,
+	}, nil
+}
 
 // ConnectionFetcher interface for getting connection counts.
 type ConnectionFetcher interface {
@@ -28,10 +55,12 @@ type Config struct {
 	Services           []string `json:"services,omitempty" yaml:"services"`
 	CacheTTL           int      `json:"cacheTTL" yaml:"cacheTTL"` // TTL in seconds
 
-	// New configuration options
+	// Configuration options
 	EnableIPScanning bool `json:"enableIPScanning" yaml:"enableIPScanning"`
 	// DiscoveryTimeout is the timeout (in seconds) for pod discovery requests.
-	DiscoveryTimeout int `json:"discoveryTimeout" yaml:"discoveryTimeout"`
+	DiscoveryTimeout int  `json:"discoveryTimeout" yaml:"discoveryTimeout"`
+	// UseKubernetesAPI enables direct Kubernetes API usage for pod discovery
+	UseKubernetesAPI bool `json:"useKubernetesAPI" yaml:"useKubernetesAPI"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -42,6 +71,7 @@ func CreateConfig() *Config {
 		CacheTTL:           30, // 30 seconds default
 		EnableIPScanning:   false,
 		DiscoveryTimeout:   2, // 2 seconds default for discovery requests
+		UseKubernetesAPI:   true, // Enable K8s API by default
 	}
 }
 
@@ -68,9 +98,13 @@ type Balancer struct {
 	lastUpdate  time.Time
 	updateMutex sync.Mutex
 
-	// New fields for discovery configuration.
+	// Discovery configuration.
 	EnableIPScanning bool
 	DiscoveryTimeout time.Duration
+	UseKubernetesAPI bool
+	
+	// Kubernetes client (initialized lazily)
+	k8sClient *K8sClient
 }
 
 // New creates a new plugin instance.
@@ -97,7 +131,21 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		ReadTimeout:        30 * time.Second,
 		EnableIPScanning:   config.EnableIPScanning,
 		DiscoveryTimeout:   time.Duration(config.DiscoveryTimeout) * time.Second,
+		UseKubernetesAPI:   config.UseKubernetesAPI,
 	}
+	
+	// Initialize k8s client if enabled
+	if b.UseKubernetesAPI {
+		var err error
+		b.k8sClient, err = NewK8sClient()
+		if err != nil {
+			log.Printf("[WARN] Failed to create Kubernetes client, falling back to default discovery: %v", err)
+			b.UseKubernetesAPI = false
+		} else {
+			log.Printf("[INFO] Successfully initialized Kubernetes client for pod discovery")
+		}
+	}
+	
 	// Start asynchronous background cache refresh.
 	b.StartBackgroundRefresh()
 	return b, nil
@@ -146,7 +194,165 @@ func (b *Balancer) GetConnections(service string) (int, []dashboard.PodMetrics, 
 	return podMetrics.AgentsConnections, []dashboard.PodMetrics{podMetrics}, nil
 }
 
+// ParseServiceInfo extracts service information from the URL
+func ParseServiceInfo(serviceURL string) (string, string, string) {
+	// Remove http:// prefix if present
+	serviceURL = strings.TrimPrefix(serviceURL, "http://")
+	
+	// Extract port if present
+	port := "80"
+	hostPart := serviceURL
+	
+	if idx := strings.Index(serviceURL, "/"); idx != -1 {
+		hostPart = serviceURL[:idx]
+	}
+	
+	if idx := strings.Index(hostPart, ":"); idx != -1 {
+		port = hostPart[idx+1:]
+		hostPart = hostPart[:idx]
+	}
+	
+	// Split by dots to get service name and namespace
+	parts := strings.Split(hostPart, ".")
+	serviceName := parts[0]
+	namespace := "default"
+	
+	if len(parts) > 1 {
+		namespace = parts[1]
+	}
+	
+	return serviceName, namespace, port
+}
+
+// GetPodsForService retrieves all pods behind a Kubernetes service
+func (k *K8sClient) GetPodsForService(ctx context.Context, serviceName, namespace string) ([]string, []string, []string, error) {
+	log.Printf("[DEBUG] Getting pods for service %s in namespace %s", serviceName, namespace)
+	
+	// Get service to find selectors
+	svc, err := k.clientset.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to get service %s in namespace %s: %v", serviceName, namespace, err)
+	}
+	
+	// Check if service has selectors
+	if len(svc.Spec.Selector) == 0 {
+		return nil, nil, nil, fmt.Errorf("service %s has no selectors", serviceName)
+	}
+	
+	// Build label selector string
+	var selectorParts []string
+	for key, value := range svc.Spec.Selector {
+		selectorParts = append(selectorParts, fmt.Sprintf("%s=%s", key, value))
+	}
+	labelSelector := strings.Join(selectorParts, ",")
+	
+	// Get pods using selector
+	pods, err := k.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to list pods with selector %s: %v", labelSelector, err)
+	}
+	
+	// Extract pod IPs, names, and nodes
+	var podIPs, podNames, nodeNames []string
+	for _, pod := range pods.Items {
+		// Only include running pods
+		if pod.Status.Phase == "Running" {
+			podIPs = append(podIPs, pod.Status.PodIP)
+			podNames = append(podNames, pod.Name)
+			nodeNames = append(nodeNames, pod.Spec.NodeName)
+			log.Printf("[DEBUG] Found pod %s with IP %s on node %s", 
+				pod.Name, pod.Status.PodIP, pod.Spec.NodeName)
+		}
+	}
+	
+	return podIPs, podNames, nodeNames, nil
+}
+
+// GetAllPodsForServiceViaK8s discovers pods using the Kubernetes API
+func (b *Balancer) GetAllPodsForServiceViaK8s(service string) ([]dashboard.PodMetrics, error) {
+	if b.k8sClient == nil {
+		return nil, fmt.Errorf("kubernetes client not initialized")
+	}
+	
+	// Parse service URL to extract service name and namespace
+	serviceName, namespace, port := ParseServiceInfo(service)
+	log.Printf("[DEBUG] Parsed service %s as: name=%s, namespace=%s, port=%s", 
+		service, serviceName, namespace, port)
+	
+	// Create a context with timeout for the k8s API call
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	// Get pod IPs, names, and node names from k8s API
+	podIPs, podNames, nodeNames, err := b.k8sClient.GetPodsForService(ctx, serviceName, namespace)
+	if err != nil {
+		log.Printf("[ERROR] Failed to get pods via Kubernetes API: %v", err)
+		return nil, err
+	}
+	
+	if len(podIPs) == 0 {
+		log.Printf("[WARN] No pods found for service %s via Kubernetes API", serviceName)
+		return nil, nil
+	}
+	
+	log.Printf("[INFO] Found %d pods for service %s via Kubernetes API", len(podIPs), serviceName)
+	
+	// Create metrics client with appropriate timeout
+	metricsClient := &http.Client{Timeout: b.DiscoveryTimeout}
+	allPodMetrics := make([]dashboard.PodMetrics, 0, len(podIPs))
+	
+	// Query each pod directly for metrics
+	for i, podIP := range podIPs {
+		podURL := fmt.Sprintf("http://%s:%s%s", podIP, port, b.MetricPath)
+		log.Printf("[DEBUG] Fetching metrics from pod at %s", podURL)
+		
+		resp, err := metricsClient.Get(podURL)
+		if err != nil {
+			log.Printf("[WARN] Failed to get metrics from pod %s: %v", podIP, err)
+			// Create a placeholder metrics object with basic info
+			podMetrics := dashboard.PodMetrics{
+				PodName:    podNames[i],
+				PodIP:      podIP,
+				NodeName:   nodeNames[i],
+				AgentsConnections: 0, // We'll assume zero connections if we can't fetch metrics
+			}
+			allPodMetrics = append(allPodMetrics, podMetrics)
+			continue
+		}
+		
+		// Successfully connected to pod, parse the metrics
+		var podMetrics dashboard.PodMetrics
+		decoder := json.NewDecoder(resp.Body)
+		if err := decoder.Decode(&podMetrics); err != nil {
+			log.Printf("[WARN] Failed to decode metrics from pod %s: %v", podIP, err)
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+		
+		// Fill in any missing information
+		if podMetrics.PodIP == "" {
+			podMetrics.PodIP = podIP
+		}
+		if podMetrics.PodName == "" {
+			podMetrics.PodName = podNames[i]
+		}
+		if podMetrics.NodeName == "" {
+			podMetrics.NodeName = nodeNames[i]
+		}
+		
+		allPodMetrics = append(allPodMetrics, podMetrics)
+		log.Printf("[DEBUG] Got metrics from pod %s: %d connections", 
+			podMetrics.PodName, podMetrics.AgentsConnections)
+	}
+	
+	return allPodMetrics, nil
+}
+
 // GetAllPodsForService discovers all pods behind a service and fetches their metrics.
+// (This is the original implementation - kept for fallback)
 func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics, error) {
 	// Step 1: Query the service for initial pod metrics.
 	log.Printf("[DEBUG] Fetching connections from service %s using metric path %s", service, b.MetricPath)
@@ -202,9 +408,10 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	}
 	headlessServiceName := serviceParts[0]
 	_ = headlessServiceName // currently not used further
-	namespace := "default"
+	// Declaring but ignoring namespace variable
+	_ = "default" // Default namespace value 
 	if len(serviceParts) > 1 {
-		namespace = serviceParts[1]
+		_ = serviceParts[1] // Namespace value ignored
 	}
 
 	// Create a dedicated discovery client with a shorter timeout.
@@ -373,7 +580,22 @@ func (b *Balancer) refreshServiceConnectionCount(service string) {
 	defer b.updateMutex.Unlock()
 
 	log.Printf("[DEBUG] Refreshing connection counts for service %s in background", service)
-	allPodMetrics, err := b.GetAllPodsForService(service)
+	
+	var allPodMetrics []dashboard.PodMetrics
+	var err error
+	
+	// Try Kubernetes API first if enabled
+	if b.UseKubernetesAPI {
+		allPodMetrics, err = b.GetAllPodsForServiceViaK8s(service)
+		if err != nil || len(allPodMetrics) == 0 {
+			log.Printf("[INFO] K8s API discovery failed, falling back to original methods: %v", err)
+			allPodMetrics, err = b.GetAllPodsForService(service)
+		}
+	} else {
+		// Use original method
+		allPodMetrics, err = b.GetAllPodsForService(service)
+	}
+	
 	if err != nil {
 		log.Printf("[ERROR] Error fetching pod metrics for service %s: %v", service, err)
 		return

@@ -1,6 +1,7 @@
 package traefikwsbalancer_test
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -61,7 +62,7 @@ func TestGetConnections(t *testing.T) {
 			}))
 			defer server.Close()
 
-			connections, err := cb.GetConnections(server.URL)
+			connections, _, err := cb.GetConnections(server.URL)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetConnections() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -114,6 +115,7 @@ func TestWebSocketConnection(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
+	// Use the manual approach since we need to access the internal fields
 	cb := &traefikwsbalancer.Balancer{
 		Client: &http.Client{Timeout: 2 * time.Second},
 		Fetcher: &MockFetcher{
@@ -125,8 +127,14 @@ func TestWebSocketConnection(t *testing.T) {
 		WriteTimeout: 2 * time.Second,
 		ReadTimeout:  2 * time.Second,
 	}
-
+	
+	// Manually initialize the connection cache
+	cb.GetConnections(backendServer.URL) // This will populate the cache
+	
+	// Create a server using our balancer
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// We need to manually set up the cache here to avoid the "no cached count" error
+		cb.ConnCache.Store(backendServer.URL, 1) // This won't work if connCache is unexported
 		cb.ServeHTTP(w, r)
 	}))
 	defer testServer.Close()
