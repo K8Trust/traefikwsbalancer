@@ -1,19 +1,49 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"time"
 
-	"github.com/K8Trust/traefikwsbalancer"
 	"github.com/K8Trust/traefikwsbalancer/ws"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
-	upgrader = ws.Upgrader{
+	// WebSocket connection counter as a Prometheus gauge
+	wsConnections prometheus.Gauge
+
+	// Track connection count for our legacy API endpoint too
+	connectionCount uint32
+)
+
+func main() {
+	// Get service information from environment variables
+	serviceName := os.Getenv("SERVICE_NAME")
+	if serviceName == "" {
+		serviceName = "websocket-service"
+	}
+	
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		// Try to get pod name from hostname as a fallback
+		var err error
+		podName, err = os.Hostname()
+		if err != nil {
+			podName = "unknown-pod"
+		}
+	}
+	
+	podIP := os.Getenv("POD_IP")
+	nodeName := os.Getenv("NODE_NAME")
+	
+	// Configure WebSocket upgrader
+	upgrader := ws.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
@@ -21,88 +51,81 @@ var (
 		ReadBufferSize:   1024,
 		WriteBufferSize:  1024,
 	}
-
-	connections1 uint32
-	connections2 uint32
-)
-
-func wsHandler(counter *uint32) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddUint32(counter, 1)
-		defer atomic.AddUint32(counter, ^uint32(0)) // decrement
-
-		c, err := upgrader.Upgrade(w, r, nil)
+	
+	// Create a Prometheus gauge with service and pod labels
+	wsConnections = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "websocket_connections_total",
+			Help: "The current number of active WebSocket connections",
+			ConstLabels: prometheus.Labels{
+				"service": serviceName,
+				"pod":     podName,
+				"pod_ip":  podIP,
+				"node":    nodeName,
+			},
+		},
+	)
+	
+	// WebSocket handler
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		// Upgrade connection to WebSocket
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Printf("Backend upgrade error: %v", err)
+			log.Printf("Failed to upgrade connection: %v", err)
 			return
 		}
-		defer c.Close()
-
-		log.Printf("Backend WebSocket connection established")
-
+		
+		// Increment connection counters
+		atomic.AddUint32(&connectionCount, 1)
+		wsConnections.Inc()
+		
+		log.Printf("WebSocket connection established, current count: %d", 
+			atomic.LoadUint32(&connectionCount))
+		
+		// Ensure we decrement counters when the connection closes
+		defer func() {
+			conn.Close()
+			atomic.AddUint32(&connectionCount, ^uint32(0)) // decrement
+			wsConnections.Dec()
+			log.Printf("WebSocket connection closed, current count: %d", 
+				atomic.LoadUint32(&connectionCount))
+		}()
+		
+		// Handle WebSocket communication
 		for {
-			mt, message, err := c.ReadMessage()
+			messageType, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("Backend read error: %v", err)
+				log.Printf("Read error: %v", err)
 				break
 			}
-			log.Printf("Backend received message: %s", message)
-
-			err = c.WriteMessage(mt, message)
-			if err != nil {
-				log.Printf("Backend write error: %v", err)
+			
+			// Echo the message back
+			if err := conn.WriteMessage(messageType, message); err != nil {
+				log.Printf("Write error: %v", err)
 				break
 			}
 		}
-	}
-}
-
-func metricsHandler(counter *uint32) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		count := atomic.LoadUint32(counter)
+	})
+	
+	// Legacy metrics endpoint for backward compatibility
+	http.HandleFunc("/metric", func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.LoadUint32(&connectionCount)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(fmt.Sprintf(`{"agentsConnections": %d}`, count)))
+		w.Write([]byte(fmt.Sprintf(`{
+			"agentsConnections": %d,
+			"podName": "%s",
+			"podIP": "%s",
+			"nodeName": "%s"
+		}`, count, podName, podIP, nodeName)))
+	})
+	
+	// Prometheus metrics endpoint
+	http.Handle("/metrics", promhttp.Handler())
+	
+	// Start the server
+	log.Printf("Starting WebSocket server on :8080")
+	log.Printf("Service: %s, Pod: %s, Node: %s", serviceName, podName, nodeName)
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatalf("Server error: %v", err)
 	}
-}
-
-func main() {
-	// Start backend server 1.
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/ws", wsHandler(&connections1))
-		mux.HandleFunc("/metric", metricsHandler(&connections1))
-		log.Printf("Starting backend server 1 on :8081")
-		if err := http.ListenAndServe(":8081", mux); err != nil {
-			log.Printf("Backend server 1 error: %v", err)
-		}
-	}()
-
-	// Start backend server 2.
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/ws", wsHandler(&connections2))
-		mux.HandleFunc("/metric", metricsHandler(&connections2))
-		log.Printf("Starting backend server 2 on :8082")
-		if err := http.ListenAndServe(":8082", mux); err != nil {
-			log.Printf("Backend server 2 error: %v", err)
-		}
-	}()
-
-	// Allow backends to start.
-	time.Sleep(time.Second)
-
-	config := traefikwsbalancer.CreateConfig()
-	config.Services = []string{
-		"http://localhost:8081",
-		"http://localhost:8082",
-	}
-
-	balancer, err := traefikwsbalancer.New(context.Background(), nil, config, "")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	http.Handle("/", balancer)
-	log.Printf("Starting balancer on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
 }

@@ -2,12 +2,18 @@
 displayName: WebSocket Connection Balancer
 type: middleware
 import: github.com/K8Trust/traefikwsbalancer
-summary: Balance WebSocket connections across multiple backends based on connection count
+summary: Balance WebSocket connections across multiple backends based on connection count monitored via Prometheus
 
 testData:
   metricPath: /metric
   balancerMetricPath: /balancer-metrics
   services:
     - http://websocket-service-1.default.svc.cluster.local:80
-    - http://websocket-service-2.default.svc.cluster.local:80
   cacheTTL: 30
+  # Prometheus configuration
+  prometheusUrl: http://prometheus-operator-kube-p-prometheus.monitoring.svc.cluster.local:9090
+  prometheusMetric: websocket_connections_total
+  serviceLabelName: service
+  podLabelName: pod
+  prometheusTimeout: 5
+  usePrometheus: true

@@ -21,17 +21,27 @@ type ConnectionFetcher interface {
 	GetConnections(string) (int, error)
 }
 
+// PodMetricsFetcher interface for getting pod-level metrics
+type PodMetricsFetcher interface {
+	GetAllPodsForService(string) ([]dashboard.PodMetrics, error)
+}
+
 // Config represents the plugin configuration.
 type Config struct {
 	MetricPath         string   `json:"metricPath,omitempty" yaml:"metricPath"`
 	BalancerMetricPath string   `json:"balancerMetricPath,omitempty" yaml:"balancerMetricPath"`
 	Services           []string `json:"services,omitempty" yaml:"services"`
 	CacheTTL           int      `json:"cacheTTL" yaml:"cacheTTL"` // TTL in seconds
+	EnableIPScanning   bool     `json:"enableIPScanning" yaml:"enableIPScanning"`
+	DiscoveryTimeout   int      `json:"discoveryTimeout" yaml:"discoveryTimeout"`
 
-	// New configuration options
-	EnableIPScanning bool `json:"enableIPScanning" yaml:"enableIPScanning"`
-	// DiscoveryTimeout is the timeout (in seconds) for pod discovery requests.
-	DiscoveryTimeout int `json:"discoveryTimeout" yaml:"discoveryTimeout"`
+	// Prometheus configuration
+	PrometheusURL     string `json:"prometheusUrl" yaml:"prometheusUrl"`
+	PrometheusMetric  string `json:"prometheusMetric" yaml:"prometheusMetric"`
+	ServiceLabelName  string `json:"serviceLabelName" yaml:"serviceLabelName"`
+	PodLabelName      string `json:"podLabelName" yaml:"podLabelName"`
+	PrometheusTimeout int    `json:"prometheusTimeout" yaml:"prometheusTimeout"`
+	UsePrometheus     bool   `json:"usePrometheus" yaml:"usePrometheus"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -42,11 +52,16 @@ func CreateConfig() *Config {
 		CacheTTL:           30, // 30 seconds default
 		EnableIPScanning:   false,
 		DiscoveryTimeout:   2, // 2 seconds default for discovery requests
+		
+		// Prometheus defaults
+		PrometheusURL:     "http://prometheus-operator-kube-p-prometheus.monitoring.svc.cluster.local:9090",
+		PrometheusMetric:  "websocket_connections_total",
+		ServiceLabelName:  "service",
+		PodLabelName:      "pod",
+		PrometheusTimeout: 5, // 5 seconds default for Prometheus API queries
+		UsePrometheus:     true, // Enable Prometheus by default
 	}
 }
-
-// PodMetrics represents metrics response from a pod.
-type PodMetrics dashboard.PodMetrics
 
 // Balancer is the connection balancer plugin.
 type Balancer struct {
@@ -57,6 +72,7 @@ type Balancer struct {
 	MetricPath         string
 	BalancerMetricPath string
 	Fetcher            ConnectionFetcher
+	PodFetcher         PodMetricsFetcher
 	DialTimeout        time.Duration
 	WriteTimeout       time.Duration
 	ReadTimeout        time.Duration
@@ -84,11 +100,15 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		log.Printf("[DEBUG] Service %d: %s", i+1, service)
 	}
 
+	// Create a client for HTTP requests
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// Initialize the balancer
 	b := &Balancer{
 		Next:               next,
 		Name:               name,
 		Services:           config.Services,
-		Client:             &http.Client{Timeout: 5 * time.Second},
+		Client:             client,
 		MetricPath:         config.MetricPath,
 		BalancerMetricPath: config.BalancerMetricPath,
 		cacheTTL:           time.Duration(config.CacheTTL) * time.Second,
@@ -98,32 +118,52 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		EnableIPScanning:   config.EnableIPScanning,
 		DiscoveryTimeout:   time.Duration(config.DiscoveryTimeout) * time.Second,
 	}
+
+	// Configure the metrics fetcher based on configuration
+	if config.UsePrometheus {
+		log.Printf("[INFO] Using Prometheus metrics source at %s", config.PrometheusURL)
+		promFetcher := NewPrometheusConnectionFetcher(
+			config.PrometheusURL,
+			config.PrometheusMetric,
+			config.ServiceLabelName,
+			config.PodLabelName,
+			time.Duration(config.PrometheusTimeout)*time.Second,
+		)
+		b.Fetcher = promFetcher
+		b.PodFetcher = promFetcher
+	} else {
+		log.Printf("[INFO] Using direct metrics fetching from services")
+		// Use the balancer itself as the default fetcher
+		b.Fetcher = b
+		b.PodFetcher = b
+	}
+
 	// Start asynchronous background cache refresh.
 	b.StartBackgroundRefresh()
 	return b, nil
 }
 
-// GetConnections retrieves the number of connections for a service
-// and pod metadata if available.
-func (b *Balancer) GetConnections(service string) (int, []dashboard.PodMetrics, error) {
-	if b.Fetcher != nil {
-		log.Printf("[DEBUG] Using custom connection fetcher for service %s", service)
-		count, err := b.Fetcher.GetConnections(service)
-		return count, nil, err
-	}
+// GetConnections retrieves the number of connections for a service.
+// This implements the ConnectionFetcher interface for direct metrics fetching.
+func (b *Balancer) GetConnections(service string) (int, error) {
+	count, err := b.getDirectConnections(service)
+	return count, err
+}
 
+// getDirectConnections retrieves connection counts directly from the service
+func (b *Balancer) getDirectConnections(service string) (int, error) {
 	log.Printf("[DEBUG] Fetching connections from service %s using metric path %s", service, b.MetricPath)
 	resp, err := b.Client.Get(service + b.MetricPath)
 	if err != nil {
 		log.Printf("[ERROR] Failed to fetch connections from service %s: %v", service, err)
-		return 0, nil, err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("[ERROR] Failed to read response body from service %s: %v", service, err)
-		return 0, nil, err
+		return 0, err
 	}
 
 	var podMetrics dashboard.PodMetrics
@@ -134,19 +174,20 @@ func (b *Balancer) GetConnections(service string) (int, []dashboard.PodMetrics, 
 		}
 		if err := json.Unmarshal(body, &legacyMetrics); err != nil {
 			log.Printf("[ERROR] Failed to decode metrics from service %s: %v", service, err)
-			return 0, nil, err
+			return 0, err
 		}
 		log.Printf("[DEBUG] Service %s reports %d connections (legacy format)",
 			service, legacyMetrics.AgentsConnections)
-		return legacyMetrics.AgentsConnections, nil, nil
+		return legacyMetrics.AgentsConnections, nil
 	}
 
 	log.Printf("[DEBUG] Service %s pod %s reports %d connections",
 		service, podMetrics.PodName, podMetrics.AgentsConnections)
-	return podMetrics.AgentsConnections, []dashboard.PodMetrics{podMetrics}, nil
+	return podMetrics.AgentsConnections, nil
 }
 
 // GetAllPodsForService discovers all pods behind a service and fetches their metrics.
+// This implements the PodMetricsFetcher interface for direct metrics fetching.
 func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics, error) {
 	// Step 1: Query the service for initial pod metrics.
 	log.Printf("[DEBUG] Fetching connections from service %s using metric path %s", service, b.MetricPath)
@@ -202,10 +243,10 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	}
 	headlessServiceName := serviceParts[0]
 	_ = headlessServiceName // currently not used further
-	namespace := "default"
-	if len(serviceParts) > 1 {
-		namespace = serviceParts[1]
-	}
+	// namespace := "default"
+	// if len(serviceParts) > 1 {
+	// 	namespace = serviceParts[1]
+	// }
 
 	// Create a dedicated discovery client with a shorter timeout.
 	discoveryClient := &http.Client{Timeout: b.DiscoveryTimeout}
@@ -367,13 +408,20 @@ func (b *Balancer) StartBackgroundRefresh() {
 	}()
 }
 
+// SetConnCache sets the connection cache map (used for testing)
+func (b *Balancer) SetConnCache(cache *sync.Map) {
+	b.connCache = *cache
+}
+
 // refreshServiceConnectionCount refreshes cached connection counts for a single service.
 func (b *Balancer) refreshServiceConnectionCount(service string) {
 	b.updateMutex.Lock()
 	defer b.updateMutex.Unlock()
 
 	log.Printf("[DEBUG] Refreshing connection counts for service %s in background", service)
-	allPodMetrics, err := b.GetAllPodsForService(service)
+	
+	// Use the pod metrics fetcher to get all pod metrics
+	allPodMetrics, err := b.PodFetcher.GetAllPodsForService(service)
 	if err != nil {
 		log.Printf("[ERROR] Error fetching pod metrics for service %s: %v", service, err)
 		return

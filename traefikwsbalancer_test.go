@@ -1,10 +1,12 @@
 package traefikwsbalancer_test
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,7 +59,7 @@ func TestGetConnections(t *testing.T) {
 
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"agentsConnections": 5}`))
+				w.Write([]byte(fmt.Sprintf(`{"agentsConnections": %d}`, tt.connections)))
 			}))
 			defer server.Close()
 
@@ -114,17 +116,20 @@ func TestWebSocketConnection(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
+	// Create a balancer with a connCache directly initialized
 	cb := &traefikwsbalancer.Balancer{
-		Client: &http.Client{Timeout: 2 * time.Second},
-		Fetcher: &MockFetcher{
-			MockURL:     backendServer.URL,
-			Connections: 1,
-		},
+		Client:       &http.Client{Timeout: 2 * time.Second},
+		Fetcher:      &MockFetcher{Connections: 1},
 		Services:     []string{backendServer.URL},
 		DialTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
 		ReadTimeout:  2 * time.Second,
 	}
+
+	// Manually initialize the connCache
+	var connCache sync.Map
+	connCache.Store(backendServer.URL, 1)  // Store the connection count directly
+	cb.SetConnCache(&connCache)
 
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cb.ServeHTTP(w, r)
