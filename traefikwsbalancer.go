@@ -7,10 +7,12 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/K8Trust/traefikwsbalancer/internal/dashboard"
 	"github.com/K8Trust/traefikwsbalancer/ws"
 )
 
@@ -37,12 +39,7 @@ func CreateConfig() *Config {
 }
 
 // PodMetrics represents metrics response from a pod
-type PodMetrics struct {
-	AgentsConnections int    `json:"agentsConnections"`
-	PodName           string `json:"podName,omitempty"`
-	PodIP             string `json:"podIP,omitempty"`
-	NodeName          string `json:"nodeName,omitempty"`
-}
+type PodMetrics dashboard.PodMetrics
 
 // Balancer is the connection balancer plugin.
 type Balancer struct {
@@ -92,7 +89,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 // GetConnections retrieves the number of connections for a service
 // and pod metadata if available.
-func (b *Balancer) GetConnections(service string) (int, []PodMetrics, error) {
+func (b *Balancer) GetConnections(service string) (int, []dashboard.PodMetrics, error) {
 	if b.Fetcher != nil {
 		log.Printf("[DEBUG] Using custom connection fetcher for service %s", service)
 		count, err := b.Fetcher.GetConnections(service)
@@ -115,7 +112,7 @@ func (b *Balancer) GetConnections(service string) (int, []PodMetrics, error) {
 	}
 
 	// Try to decode as pod metrics first
-	var podMetrics PodMetrics
+	var podMetrics dashboard.PodMetrics
 	if err := json.Unmarshal(body, &podMetrics); err != nil {
 		log.Printf("[DEBUG] Failed to decode as pod metrics, trying legacy format: %v", err)
 		// If that fails, try the legacy format with just agentsConnections
@@ -135,11 +132,11 @@ func (b *Balancer) GetConnections(service string) (int, []PodMetrics, error) {
 
 	log.Printf("[DEBUG] Service %s pod %s reports %d connections", 
 		service, podMetrics.PodName, podMetrics.AgentsConnections)
-	return podMetrics.AgentsConnections, []PodMetrics{podMetrics}, nil
+	return podMetrics.AgentsConnections, []dashboard.PodMetrics{podMetrics}, nil
 }
 
 // GetAllPodsForService discovers all pods behind a service and fetches their metrics
-func (b *Balancer) GetAllPodsForService(service string) ([]PodMetrics, error) {
+func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics, error) {
 	// Step 1: Query the service to get the initial pod metrics
 	log.Printf("[DEBUG] Fetching connections from service %s using metric path %s", service, b.MetricPath)
 	resp, err := b.Client.Get(service + b.MetricPath)
@@ -157,7 +154,7 @@ func (b *Balancer) GetAllPodsForService(service string) ([]PodMetrics, error) {
 	}
 	
 	// Try to decode initial pod metrics
-	var initialPodMetrics PodMetrics
+	var initialPodMetrics dashboard.PodMetrics
 	if err := json.Unmarshal(body, &initialPodMetrics); err != nil {
 		log.Printf("[DEBUG] Failed to decode as pod metrics, trying legacy format: %v", err)
 		// If that fails, try the legacy format with just agentsConnections
@@ -171,22 +168,22 @@ func (b *Balancer) GetAllPodsForService(service string) ([]PodMetrics, error) {
 		}
 		
 		// For legacy metrics, we don't have pod info, so just return a single pod metric
-		dummyPod := PodMetrics{
+		dummyPod := dashboard.PodMetrics{
 			AgentsConnections: legacyMetrics.AgentsConnections,
 		}
-		return []PodMetrics{dummyPod}, nil
+		return []dashboard.PodMetrics{dummyPod}, nil
 	}
 	
 	// Step 2: If we have pod info, try to discover other pods
 	if initialPodMetrics.PodName == "" || initialPodMetrics.PodIP == "" {
 		// No pod info available, just return the single metric
-		return []PodMetrics{initialPodMetrics}, nil
+		return []dashboard.PodMetrics{initialPodMetrics}, nil
 	}
 	
 	log.Printf("[DEBUG] Found pod info, will attempt to discover all pods for service %s", service)
 	
 	// Start with the pod we already found
-	allPodMetrics := []PodMetrics{initialPodMetrics}
+	allPodMetrics := []dashboard.PodMetrics{initialPodMetrics}
 	
 	// Extract service DNS name for direct pod queries
 	serviceBase := strings.TrimPrefix(service, "http://")
@@ -254,7 +251,7 @@ func (b *Balancer) GetAllPodsForService(service string) ([]PodMetrics, error) {
 						defer podResp.Body.Close()
 						podBody, err := io.ReadAll(podResp.Body)
 						if err == nil {
-							var podMetrics PodMetrics
+							var podMetrics dashboard.PodMetrics
 							if json.Unmarshal(podBody, &podMetrics) == nil {
 								allPodMetrics = append(allPodMetrics, podMetrics)
 								log.Printf("[DEBUG] Discovered pod %s with %d connections via endpoints API",
@@ -303,7 +300,7 @@ func (b *Balancer) GetAllPodsForService(service string) ([]PodMetrics, error) {
 			continue
 		}
 		
-		var podMetrics PodMetrics
+		var podMetrics dashboard.PodMetrics
 		if err := json.Unmarshal(podBody, &podMetrics); err != nil {
 			log.Printf("[ERROR] Failed to decode metrics from pod %s: %v", potentialPodURL, err)
 			continue
@@ -323,44 +320,42 @@ func (b *Balancer) GetAllPodsForService(service string) ([]PodMetrics, error) {
 		if len(ipParts) == 4 {
 			// Try adjacent IPs by incrementing/decrementing the last octet
 			baseIP := strings.Join(ipParts[:3], ".")
-			lastOctet, err := fmt.Sscanf(ipParts[3], "%d", new(int))
-			if err == nil {
-				// Try a range of IPs around the known one
-				currentOctet := lastOctet
-				for offset := 1; offset <= 10; offset++ {
-					// Try incrementing
-					potentialIP := fmt.Sprintf("%s.%d", baseIP, currentOctet+offset)
-					potentialURL := fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
+			lastOctet, _ := strconv.Atoi(ipParts[3])
+			
+			// Try a range of IPs around the known one
+			for offset := 1; offset <= 10; offset++ {
+				// Try incrementing
+				potentialIP := fmt.Sprintf("%s.%d", baseIP, lastOctet+offset)
+				potentialURL := fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
+				
+				podResp, err := b.Client.Get(potentialURL)
+				if err == nil {
+					podBody, _ := io.ReadAll(podResp.Body)
+					podResp.Body.Close()
+					
+					var podMetrics dashboard.PodMetrics
+					if json.Unmarshal(podBody, &podMetrics) == nil && podMetrics.PodName != initialPodMetrics.PodName {
+						allPodMetrics = append(allPodMetrics, podMetrics)
+						log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning", 
+							podMetrics.PodName, podMetrics.AgentsConnections)
+					}
+				}
+				
+				// Try decrementing
+				if lastOctet-offset > 0 {
+					potentialIP = fmt.Sprintf("%s.%d", baseIP, lastOctet-offset)
+					potentialURL = fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
 					
 					podResp, err := b.Client.Get(potentialURL)
 					if err == nil {
 						podBody, _ := io.ReadAll(podResp.Body)
 						podResp.Body.Close()
 						
-						var podMetrics PodMetrics
-						if json.Unmarshal(podBody, &podMetrics) == nil {
+						var podMetrics dashboard.PodMetrics
+						if json.Unmarshal(podBody, &podMetrics) == nil && podMetrics.PodName != initialPodMetrics.PodName {
 							allPodMetrics = append(allPodMetrics, podMetrics)
 							log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning", 
 								podMetrics.PodName, podMetrics.AgentsConnections)
-						}
-					}
-					
-					// Try decrementing
-					if currentOctet-offset > 0 {
-						potentialIP = fmt.Sprintf("%s.%d", baseIP, currentOctet-offset)
-						potentialURL = fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
-						
-						podResp, err := b.Client.Get(potentialURL)
-						if err == nil {
-							podBody, _ := io.ReadAll(podResp.Body)
-							podResp.Body.Close()
-							
-							var podMetrics PodMetrics
-							if json.Unmarshal(podBody, &podMetrics) == nil {
-								allPodMetrics = append(allPodMetrics, podMetrics)
-								log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning", 
-									podMetrics.PodName, podMetrics.AgentsConnections)
-							}
 						}
 					}
 				}
@@ -406,7 +401,7 @@ func (b *Balancer) getCachedConnections(service string) (int, error) {
 
 // GetAllCachedConnections returns a map of all service connection counts
 // and pod metrics if available
-func (b *Balancer) GetAllCachedConnections() (map[string]int, map[string][]PodMetrics) {
+func (b *Balancer) GetAllCachedConnections() (map[string]int, map[string][]dashboard.PodMetrics) {
 	b.updateMutex.Lock()
 	defer b.updateMutex.Unlock()
 
@@ -439,7 +434,7 @@ func (b *Balancer) GetAllCachedConnections() (map[string]int, map[string][]PodMe
 
 	// Build maps of service connection counts and pod metrics
 	connections := make(map[string]int)
-	podMetricsMap := make(map[string][]PodMetrics)
+	podMetricsMap := make(map[string][]dashboard.PodMetrics)
 	
 	for _, service := range b.Services {
 		if count, ok := b.connCache.Load(service); ok {
@@ -449,7 +444,7 @@ func (b *Balancer) GetAllCachedConnections() (map[string]int, map[string][]PodMe
 		}
 		
 		if metrics, ok := b.podMetrics.Load(service); ok {
-			podMetricsMap[service] = metrics.([]PodMetrics)
+			podMetricsMap[service] = metrics.([]dashboard.PodMetrics)
 		}
 	}
 
@@ -459,7 +454,17 @@ func (b *Balancer) GetAllCachedConnections() (map[string]int, map[string][]PodMe
 func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Check if this is a request to our balancer metrics endpoint
 	if req.URL.Path == b.BalancerMetricPath {
-		b.handleMetricRequest(rw, req)
+		// Check if format=json is specified or if Accept header prefers application/json
+		format := req.URL.Query().Get("format")
+		acceptHeader := req.Header.Get("Accept")
+		
+		if format == "json" || strings.Contains(acceptHeader, "application/json") {
+			// Use existing JSON handler
+			b.handleMetricRequest(rw, req)
+		} else {
+			// Use new HTML handler for pretty display
+			b.handleHTMLMetricRequest(rw, req)
+		}
 		return
 	}
 
@@ -513,7 +518,7 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 // handleMetricRequest responds with current connection metrics for all backends
 func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request) {
-	log.Printf("[DEBUG] Handling balancer metrics request")
+	log.Printf("[DEBUG] Handling JSON balancer metrics request")
 	
 	// Get connection counts for all services, with enhanced pod discovery
 	serviceConnections, podMetricsMap := b.GetAllCachedConnections()
@@ -525,11 +530,11 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 	}
 	
 	response := struct {
-		Timestamp         string                  `json:"timestamp"`
-		Services          []ServiceMetric         `json:"services"`
-		PodMetrics        map[string][]PodMetrics `json:"podMetrics,omitempty"`
-		TotalCount        int                     `json:"totalConnections"`
-		AgentsConnections int                     `json:"agentsConnections"` // For compatibility with backend metrics
+		Timestamp         string                          `json:"timestamp"`
+		Services          []ServiceMetric                 `json:"services"`
+		PodMetrics        map[string][]dashboard.PodMetrics `json:"podMetrics,omitempty"`
+		TotalCount        int                             `json:"totalConnections"`
+		AgentsConnections int                             `json:"agentsConnections"` // For compatibility with backend metrics
 	}{
 		Timestamp:  time.Now().Format(time.RFC3339),
 		Services:   make([]ServiceMetric, 0, len(serviceConnections)),
@@ -555,6 +560,24 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 		http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+}
+
+// handleHTMLMetricRequest serves the HTML dashboard for the metrics
+func (b *Balancer) handleHTMLMetricRequest(rw http.ResponseWriter, req *http.Request) {
+	log.Printf("[DEBUG] Handling HTML balancer metrics request")
+	
+	// Get connection counts for all services
+	serviceConnections, podMetricsMap := b.GetAllCachedConnections()
+	
+	// Prepare metrics data for the dashboard
+	data := dashboard.PrepareMetricsData(
+		serviceConnections,
+		podMetricsMap,
+		b.BalancerMetricPath,
+	)
+	
+	// Render the HTML dashboard
+	dashboard.RenderHTML(rw, req, data)
 }
 
 func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, targetService string) {
