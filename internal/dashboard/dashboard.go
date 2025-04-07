@@ -26,13 +26,13 @@ type PodMetrics struct {
 
 // MetricsData contains all the metrics information needed for rendering
 type MetricsData struct {
-	Timestamp         string
-	Services          []ServiceMetric
-	PodMetricsMap     map[string][]PodMetrics
-	TotalConnections  int
-	ServiceCount      int
-	PodCount          int
-	RefreshInterval   int
+	Timestamp          string
+	Services           []ServiceMetric
+	PodMetricsMap      map[string][]PodMetrics
+	TotalConnections   int
+	ServiceCount       int
+	PodCount           int
+	RefreshInterval    int
 	BalancerMetricPath string
 }
 
@@ -265,12 +265,12 @@ func PrepareMetricsData(
 	}
 	
 	return MetricsData{
-		Timestamp:         time.Now().Format(time.RFC3339),
-		Services:          services,
-		PodMetricsMap:     podMetricsMap,
-		TotalConnections:  totalConnections,
-		ServiceCount:      len(services),
-		PodCount:          totalPods,
+		Timestamp:          time.Now().Format(time.RFC3339),
+		Services:           services,
+		PodMetricsMap:      podMetricsMap,
+		TotalConnections:   totalConnections,
+		ServiceCount:       len(services),
+		PodCount:           totalPods,
 		BalancerMetricPath: balancerMetricPath,
 	}
 }
