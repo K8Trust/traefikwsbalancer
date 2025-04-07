@@ -61,13 +61,17 @@ func TestGetConnections(t *testing.T) {
 			}))
 			defer server.Close()
 
-			connections, err := cb.GetConnections(server.URL)
+			connections, podMetrics, err := cb.GetConnections(server.URL)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetConnections() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !tt.wantErr && connections != tt.connections {
 				t.Errorf("GetConnections() = %v, want %v", connections, tt.connections)
+			}
+			// We expect podMetrics to be nil when using the mock fetcher
+			if !tt.wantErr && podMetrics != nil {
+				t.Errorf("Expected nil podMetrics when using mock fetcher, got %v", podMetrics)
 			}
 		})
 	}
@@ -114,6 +118,7 @@ func TestWebSocketConnection(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
+	// Create a balancer for testing
 	cb := &traefikwsbalancer.Balancer{
 		Client: &http.Client{Timeout: 2 * time.Second},
 		Fetcher: &MockFetcher{
@@ -125,6 +130,9 @@ func TestWebSocketConnection(t *testing.T) {
 		WriteTimeout: 2 * time.Second,
 		ReadTimeout:  2 * time.Second,
 	}
+
+	// Manually initialize the connection cache for testing
+	cb.InitializeConnectionCacheForTest(backendServer.URL, 1)
 
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cb.ServeHTTP(w, r)
