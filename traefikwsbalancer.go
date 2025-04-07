@@ -138,7 +138,16 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		b.PodFetcher = b
 	}
 
-	// Start asynchronous background cache refresh.
+	// Initialize the connection cache immediately
+	go func() {
+		log.Printf("[INFO] Performing initial connection cache population")
+		for _, service := range b.Services {
+			b.refreshServiceConnectionCount(service)
+		}
+		log.Printf("[INFO] Initial connection cache population completed")
+	}()
+
+	// Start asynchronous background refresh.
 	b.StartBackgroundRefresh()
 	return b, nil
 }
@@ -366,6 +375,7 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 }
 
 // getCachedConnections returns the cached connection count for a service.
+// Returns 0 connections with an error when the cache is empty for the service.
 func (b *Balancer) getCachedConnections(service string) (int, error) {
 	if count, ok := b.connCache.Load(service); ok {
 		return count.(int), nil
@@ -424,6 +434,14 @@ func (b *Balancer) refreshServiceConnectionCount(service string) {
 	allPodMetrics, err := b.PodFetcher.GetAllPodsForService(service)
 	if err != nil {
 		log.Printf("[ERROR] Error fetching pod metrics for service %s: %v", service, err)
+		// On error, if we already have a cached value, keep using it
+		if _, exists := b.connCache.Load(service); !exists {
+			// If no existing cache entry, initialize with 0 connections
+			// This ensures we at least have a value for routing
+			b.connCache.Store(service, 0)
+			emptyPods := []dashboard.PodMetrics{}
+			b.podMetrics.Store(service, emptyPods)
+		}
 		return
 	}
 
@@ -459,12 +477,34 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	log.Printf("[DEBUG] Checking connection counts across services:")
 	allServiceConnections := make(map[string]int)
 
+	// Check if cache has been initialized for any service
+	cacheMiss := true
+
 	for _, service := range b.Services {
 		connections, err := b.getCachedConnections(service)
 		if err != nil {
-			log.Printf("[ERROR] Failed to get connections for service %s: %v", service, err)
-			continue
+			// If cache miss, try to refresh the cache for this service immediately
+			if strings.Contains(err.Error(), "no cached count for service") {
+				log.Printf("[DEBUG] Cache miss for service %s, refreshing now", service)
+				b.refreshServiceConnectionCount(service)
+				// Try again after refresh
+				connections, err = b.getCachedConnections(service)
+				if err != nil {
+					log.Printf("[ERROR] Failed to get connections after refresh for service %s: %v", service, err)
+					// Use 0 as the connection count when cache is unavailable
+					connections = 0
+				} else {
+					cacheMiss = false
+				}
+			} else {
+				log.Printf("[ERROR] Failed to get connections for service %s: %v", service, err)
+				// Use 0 as the connection count on error
+				connections = 0
+			}
+		} else {
+			cacheMiss = false
 		}
+
 		allServiceConnections[service] = connections
 		log.Printf("[DEBUG] Service %s has %d active connections", service, connections)
 		if connections < minConnections {
@@ -472,6 +512,12 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			selectedService = service
 			log.Printf("[DEBUG] New minimum found: service %s with %d connections", service, connections)
 		}
+	}
+
+	// If cache completely empty, select the first service by default
+	if cacheMiss && selectedService == "" && len(b.Services) > 0 {
+		selectedService = b.Services[0]
+		log.Printf("[INFO] Cache not initialized yet, using first service %s as default", selectedService)
 	}
 
 	if selectedService == "" {
