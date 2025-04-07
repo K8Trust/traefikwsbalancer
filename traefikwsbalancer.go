@@ -530,11 +530,11 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 	}
 	
 	response := struct {
-		Timestamp         string                          `json:"timestamp"`
-		Services          []ServiceMetric                 `json:"services"`
+		Timestamp         string                           `json:"timestamp"`
+		Services          []ServiceMetric                  `json:"services"`
 		PodMetrics        map[string][]dashboard.PodMetrics `json:"podMetrics,omitempty"`
-		TotalCount        int                             `json:"totalConnections"`
-		AgentsConnections int                             `json:"agentsConnections"` // For compatibility with backend metrics
+		TotalCount        int                              `json:"totalConnections"`
+		AgentsConnections int                              `json:"agentsConnections"` // For compatibility with backend metrics
 	}{
 		Timestamp:  time.Now().Format(time.RFC3339),
 		Services:   make([]ServiceMetric, 0, len(serviceConnections)),

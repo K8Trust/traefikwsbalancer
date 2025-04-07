@@ -73,10 +73,30 @@ func getHTMLTemplate(data MetricsData) string {
                 <input type="checkbox" id="auto-refresh" checked>
                 <label for="auto-refresh">Auto-refresh</label>
                 <select id="refresh-interval">
-                    <option value="5"` + (data.RefreshInterval == 5 ? " selected" : "") + `>5s</option>
-                    <option value="10"` + (data.RefreshInterval == 10 ? " selected" : "") + `>10s</option>
-                    <option value="30"` + (data.RefreshInterval == 30 ? " selected" : "") + `>30s</option>
-                    <option value="60"` + (data.RefreshInterval == 60 ? " selected" : "") + `>60s</option>
+                    <option value="5"` + (func() string {
+						if data.RefreshInterval == 5 {
+							return " selected"
+						}
+						return ""
+					})() + `>5s</option>
+                    <option value="10"` + (func() string {
+						if data.RefreshInterval == 10 {
+							return " selected"
+						}
+						return ""
+					})() + `>10s</option>
+                    <option value="30"` + (func() string {
+						if data.RefreshInterval == 30 {
+							return " selected"
+						}
+						return ""
+					})() + `>30s</option>
+                    <option value="60"` + (func() string {
+						if data.RefreshInterval == 60 {
+							return " selected"
+						}
+						return ""
+					})() + `>60s</option>
                 </select>
                 <span id="refresh-status" class="refresh-status"></span>
             </div>
