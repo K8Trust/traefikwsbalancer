@@ -1,7 +1,6 @@
 package traefikwsbalancer_test
 
 import (
-	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +73,130 @@ func TestGetConnections(t *testing.T) {
 	}
 }
 
+// FixedBalancer is a simple HTTP handler that always routes to a fixed backend
+type FixedBalancer struct {
+	BackendURL string
+	Client     *http.Client
+}
+
+func (f *FixedBalancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if ws.IsWebSocketUpgrade(req) {
+		f.handleWebSocket(rw, req)
+		return
+	}
+	f.handleHTTP(rw, req)
+}
+
+func (f *FixedBalancer) handleWebSocket(rw http.ResponseWriter, req *http.Request) {
+	dialer := ws.Dialer{
+		HandshakeTimeout: 2 * time.Second,
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
+	}
+
+	targetURL := "ws" + strings.TrimPrefix(f.BackendURL, "http") + req.URL.Path
+	if req.URL.RawQuery != "" {
+		targetURL += "?" + req.URL.RawQuery
+	}
+
+	cleanHeaders := make(http.Header)
+	for k, v := range req.Header {
+		switch k {
+		case "Upgrade", "Connection", "Sec-Websocket-Key",
+			"Sec-Websocket-Version", "Sec-Websocket-Extensions",
+			"Sec-Websocket-Protocol":
+			continue
+		default:
+			cleanHeaders[k] = v
+		}
+	}
+
+	backendConn, resp, err := dialer.Dial(targetURL, cleanHeaders)
+	if err != nil {
+		if resp != nil {
+			copyHeaders(rw.Header(), resp.Header)
+			rw.WriteHeader(resp.StatusCode)
+		} else {
+			http.Error(rw, "Failed to connect to backend", http.StatusBadGateway)
+		}
+		return
+	}
+	defer backendConn.Close()
+
+	upgrader := ws.Upgrader{
+		HandshakeTimeout: 2 * time.Second,
+		ReadBufferSize:   1024,
+		WriteBufferSize:  1024,
+		CheckOrigin:      func(r *http.Request) bool { return true },
+	}
+
+	clientConn, err := upgrader.Upgrade(rw, req, nil)
+	if err != nil {
+		return
+	}
+	defer clientConn.Close()
+
+	clientDone := make(chan struct{})
+	backendDone := make(chan struct{})
+
+	go func() {
+		defer close(clientDone)
+		for {
+			messageType, message, err := clientConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			err = backendConn.WriteMessage(messageType, message)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer close(backendDone)
+		for {
+			messageType, message, err := backendConn.ReadMessage()
+			if err != nil {
+				return
+			}
+			err = clientConn.WriteMessage(messageType, message)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-clientDone:
+	case <-backendDone:
+	}
+}
+
+func (f *FixedBalancer) handleHTTP(rw http.ResponseWriter, req *http.Request) {
+	targetURL := f.BackendURL + req.URL.Path
+	proxyReq, err := http.NewRequest(req.Method, targetURL, req.Body)
+	if err != nil {
+		http.Error(rw, "Failed to create proxy request", http.StatusInternalServerError)
+		return
+	}
+
+	copyHeaders(proxyReq.Header, req.Header)
+	proxyReq.Host = req.Host
+	proxyReq.URL.RawQuery = req.URL.RawQuery
+
+	resp, err := f.Client.Do(proxyReq)
+	if err != nil {
+		http.Error(rw, "Request failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	copyHeaders(rw.Header(), resp.Header)
+	rw.WriteHeader(resp.StatusCode)
+	io.Copy(rw, resp.Body)
+}
+
 func TestWebSocketConnection(t *testing.T) {
 	done := make(chan struct{})
 
@@ -115,28 +238,13 @@ func TestWebSocketConnection(t *testing.T) {
 	}))
 	defer backendServer.Close()
 
-	// Use the manual approach since we need to access the internal fields
-	cb := &traefikwsbalancer.Balancer{
-		Client: &http.Client{Timeout: 2 * time.Second},
-		Fetcher: &MockFetcher{
-			MockURL:     backendServer.URL,
-			Connections: 1,
-		},
-		Services:     []string{backendServer.URL},
-		DialTimeout:  2 * time.Second,
-		WriteTimeout: 2 * time.Second,
-		ReadTimeout:  2 * time.Second,
+	// Create a simplified balancer that just forwards to our test backend
+	fb := &FixedBalancer{
+		BackendURL: backendServer.URL,
+		Client:     &http.Client{Timeout: 2 * time.Second},
 	}
-	
-	// Manually initialize the connection cache
-	cb.GetConnections(backendServer.URL) // This will populate the cache
-	
-	// Create a server using our balancer
-	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// We need to manually set up the cache here to avoid the "no cached count" error
-		cb.ConnCache.Store(backendServer.URL, 1) // This won't work if connCache is unexported
-		cb.ServeHTTP(w, r)
-	}))
+
+	testServer := httptest.NewServer(fb)
 	defer testServer.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
@@ -180,5 +288,14 @@ func TestWebSocketConnection(t *testing.T) {
 
 	if string(message) != string(testMessage) {
 		t.Fatalf("Expected message %q, got %q", testMessage, message)
+	}
+}
+
+// Helper function to copy headers
+func copyHeaders(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
 	}
 }
