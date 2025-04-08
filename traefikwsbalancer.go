@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,8 +68,9 @@ type Balancer struct {
 	updateMutex sync.Mutex
 
 	// New fields for discovery configuration.
-	EnableIPScanning bool
-	DiscoveryTimeout time.Duration
+	EnableIPScanning   bool
+	DiscoveryTimeout   time.Duration
+	KubernetesAPIURL  string // URL of the Kubernetes API server
 }
 
 // New creates a new plugin instance.
@@ -148,177 +148,97 @@ func (b *Balancer) GetConnections(service string) (int, []dashboard.PodMetrics, 
 
 // GetAllPodsForService discovers all pods behind a service and fetches their metrics.
 func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics, error) {
-	// Step 1: Query the service for initial pod metrics.
-	log.Printf("[DEBUG] Fetching connections from service %s using metric path %s", service, b.MetricPath)
-	resp, err := b.Client.Get(service + b.MetricPath)
-	if err != nil {
-		log.Printf("[ERROR] Failed to fetch connections from service %s: %v", service, err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[ERROR] Failed to read response body from service %s: %v", service, err)
-		return nil, err
-	}
-
-	var initialPodMetrics dashboard.PodMetrics
-	if err := json.Unmarshal(body, &initialPodMetrics); err != nil {
-		log.Printf("[DEBUG] Failed to decode as pod metrics, trying legacy format: %v", err)
-		var legacyMetrics struct {
-			AgentsConnections int `json:"agentsConnections"`
-		}
-		if err := json.Unmarshal(body, &legacyMetrics); err != nil {
-			log.Printf("[ERROR] Failed to decode metrics from service %s: %v", service, err)
-			return nil, err
-		}
-		dummyPod := dashboard.PodMetrics{
-			AgentsConnections: legacyMetrics.AgentsConnections,
-		}
-		return []dashboard.PodMetrics{dummyPod}, nil
-	}
-
-	// If no pod info is available, return the single metric.
-	if initialPodMetrics.PodName == "" || initialPodMetrics.PodIP == "" {
-		return []dashboard.PodMetrics{initialPodMetrics}, nil
-	}
-
-	log.Printf("[DEBUG] Found pod info, will attempt to discover all pods for service %s", service)
-	allPodMetrics := []dashboard.PodMetrics{initialPodMetrics}
-
-	// Extract service DNS name.
+	// Extract service DNS name and namespace
 	serviceBase := strings.TrimPrefix(service, "http://")
-	podName := initialPodMetrics.PodName
-	parts := strings.Split(podName, "-")
-	if len(parts) < 2 {
-		return allPodMetrics, nil
-	}
-	baseNameParts := parts[:len(parts)-1]
-	baseName := strings.Join(baseNameParts, "-")
 	serviceParts := strings.Split(serviceBase, ".")
-	if len(serviceParts) == 0 {
-		return allPodMetrics, nil
-	}
-	headlessServiceName := serviceParts[0]
-	_ = headlessServiceName // currently not used further
-	namespace := "default"
-	if len(serviceParts) > 1 {
-		namespace = serviceParts[1]
+	if len(serviceParts) < 2 {
+		return nil, fmt.Errorf("invalid service URL format: %s", service)
 	}
 
-	// Create a dedicated discovery client with a shorter timeout.
+	serviceName := serviceParts[0]
+	namespace := serviceParts[1]
+	if len(serviceParts) < 3 {
+		namespace = "default"
+	}
+
+	// Create a dedicated discovery client with a shorter timeout
 	discoveryClient := &http.Client{Timeout: b.DiscoveryTimeout}
 
-	// Pattern 1: Try using the endpoints API.
-	endpointsURL := fmt.Sprintf("%s/endpoints", service)
+	// Use the configured Kubernetes API URL or fall back to the default
+	k8sAPIURL := b.KubernetesAPIURL
+	if k8sAPIURL == "" {
+		k8sAPIURL = "http://kubernetes.default.svc"
+	}
+
+	// Step 1: Query the Kubernetes API for endpoints
+	endpointsURL := fmt.Sprintf("%s/api/v1/namespaces/%s/endpoints/%s", k8sAPIURL, namespace, serviceName)
+	log.Printf("[DEBUG] Querying Kubernetes endpoints API: %s", endpointsURL)
+
 	endpointsResp, err := discoveryClient.Get(endpointsURL)
-	if err == nil {
-		defer endpointsResp.Body.Close()
-		endpointsBody, err := io.ReadAll(endpointsResp.Body)
-		if err == nil {
-			var endpoints struct {
-				Pods []struct {
+	if err != nil {
+		log.Printf("[ERROR] Failed to query Kubernetes endpoints API: %v", err)
+		return nil, err
+	}
+	defer endpointsResp.Body.Close()
+
+	var k8sEndpoints struct {
+		Subsets []struct {
+			Addresses []struct {
+				IP   string `json:"ip"`
+				TargetRef struct {
 					Name string `json:"name"`
-					IP   string `json:"ip"`
-				} `json:"pods"`
+				} `json:"targetRef"`
+			} `json:"addresses"`
+		} `json:"subsets"`
+	}
+
+	if err := json.NewDecoder(endpointsResp.Body).Decode(&k8sEndpoints); err != nil {
+		log.Printf("[ERROR] Failed to decode Kubernetes endpoints response: %v", err)
+		return nil, err
+	}
+
+	if len(k8sEndpoints.Subsets) == 0 || len(k8sEndpoints.Subsets[0].Addresses) == 0 {
+		log.Printf("[WARN] No endpoints found for service %s in namespace %s", serviceName, namespace)
+		return nil, fmt.Errorf("no endpoints found for service %s", serviceName)
+	}
+
+	// Step 2: Collect metrics from all discovered pods
+	var allPodMetrics []dashboard.PodMetrics
+	for _, subset := range k8sEndpoints.Subsets {
+		for _, address := range subset.Addresses {
+			podURL := fmt.Sprintf("http://%s%s", address.IP, b.MetricPath)
+			log.Printf("[DEBUG] Fetching metrics from pod %s at %s", address.TargetRef.Name, podURL)
+
+			podResp, err := discoveryClient.Get(podURL)
+			if err != nil {
+				log.Printf("[ERROR] Failed to fetch metrics from pod %s: %v", address.TargetRef.Name, err)
+				continue
 			}
-			if json.Unmarshal(endpointsBody, &endpoints) == nil && len(endpoints.Pods) > 0 {
-				for _, pod := range endpoints.Pods {
-					if pod.Name == initialPodMetrics.PodName {
-						continue
-					}
-					podURL := fmt.Sprintf("http://%s%s", pod.IP, b.MetricPath)
-					podResp, err := discoveryClient.Get(podURL)
-					if err == nil {
-						defer podResp.Body.Close()
-						podBody, err := io.ReadAll(podResp.Body)
-						if err == nil {
-							var podMetrics dashboard.PodMetrics
-							if json.Unmarshal(podBody, &podMetrics) == nil {
-								allPodMetrics = append(allPodMetrics, podMetrics)
-								log.Printf("[DEBUG] Discovered pod %s with %d connections via endpoints API",
-									podMetrics.PodName, podMetrics.AgentsConnections)
-							}
-						}
-					}
-				}
-				if len(allPodMetrics) > 1 {
-					return allPodMetrics, nil
-				}
+
+			var podMetrics dashboard.PodMetrics
+			if err := json.NewDecoder(podResp.Body).Decode(&podMetrics); err != nil {
+				podResp.Body.Close()
+				log.Printf("[ERROR] Failed to decode metrics from pod %s: %v", address.TargetRef.Name, err)
+				continue
 			}
+			podResp.Body.Close()
+
+			// Ensure pod name is set from Kubernetes metadata
+			if podMetrics.PodName == "" {
+				podMetrics.PodName = address.TargetRef.Name
+			}
+			if podMetrics.PodIP == "" {
+				podMetrics.PodIP = address.IP
+			}
+
+			allPodMetrics = append(allPodMetrics, podMetrics)
+			log.Printf("[DEBUG] Successfully collected metrics from pod %s: %d connections",
+				podMetrics.PodName, podMetrics.AgentsConnections)
 		}
 	}
 
-	// Pattern 2: Try direct pod DNS naming.
-	for i := 0; i < 10; i++ {
-		potentialPodName := fmt.Sprintf("%s-%d", baseName, i)
-		if potentialPodName == initialPodMetrics.PodName {
-			continue
-		}
-		potentialPodURL := fmt.Sprintf("http://%s.%s%s", potentialPodName, serviceBase, b.MetricPath)
-		log.Printf("[DEBUG] Trying to discover pod via DNS: %s", potentialPodURL)
-		podResp, err := discoveryClient.Get(potentialPodURL)
-		if err != nil {
-			continue
-		}
-		defer podResp.Body.Close()
-		podBody, err := io.ReadAll(podResp.Body)
-		if err != nil {
-			log.Printf("[ERROR] Failed to read response from pod %s: %v", potentialPodURL, err)
-			continue
-		}
-		var podMetrics dashboard.PodMetrics
-		if err := json.Unmarshal(podBody, &podMetrics); err != nil {
-			log.Printf("[ERROR] Failed to decode metrics from pod %s: %v", potentialPodURL, err)
-			continue
-		}
-		allPodMetrics = append(allPodMetrics, podMetrics)
-		log.Printf("[DEBUG] Discovered pod %s with %d connections via DNS",
-			podMetrics.PodName, podMetrics.AgentsConnections)
-	}
-
-	// Pattern 3: Try IP scanning as a last resort (if enabled).
-	if initialPodMetrics.PodIP != "" && b.EnableIPScanning {
-		ipParts := strings.Split(initialPodMetrics.PodIP, ".")
-		if len(ipParts) == 4 {
-			baseIP := strings.Join(ipParts[:3], ".")
-			lastOctet, err := strconv.Atoi(ipParts[3])
-			if err == nil {
-				for offset := 1; offset <= 10; offset++ {
-					// Incrementing.
-					potentialIP := fmt.Sprintf("%s.%d", baseIP, lastOctet+offset)
-					potentialURL := fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
-					podResp, err := discoveryClient.Get(potentialURL)
-					if err == nil {
-						podBody, _ := io.ReadAll(podResp.Body)
-						podResp.Body.Close()
-						var podMetrics dashboard.PodMetrics
-						if err := json.Unmarshal(podBody, &podMetrics); err == nil && podMetrics.PodName != initialPodMetrics.PodName {
-							allPodMetrics = append(allPodMetrics, podMetrics)
-							log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning",
-								podMetrics.PodName, podMetrics.AgentsConnections)
-						}
-					}
-					// Decrementing.
-					if lastOctet-offset > 0 {
-						potentialIP = fmt.Sprintf("%s.%d", baseIP, lastOctet-offset)
-						potentialURL = fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
-						podResp, err = discoveryClient.Get(potentialURL)
-						if err == nil {
-							podBody, _ := io.ReadAll(podResp.Body)
-							podResp.Body.Close()
-							var podMetrics dashboard.PodMetrics
-							if err := json.Unmarshal(podBody, &podMetrics); err == nil && podMetrics.PodName != initialPodMetrics.PodName {
-								allPodMetrics = append(allPodMetrics, podMetrics)
-								log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning",
-									podMetrics.PodName, podMetrics.AgentsConnections)
-							}
-						}
-					}
-				}
-			}
-		}
+	if len(allPodMetrics) == 0 {
+		return nil, fmt.Errorf("failed to collect metrics from any pods for service %s", serviceName)
 	}
 
 	return allPodMetrics, nil
