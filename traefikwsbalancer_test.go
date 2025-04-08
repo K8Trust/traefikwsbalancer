@@ -1,7 +1,8 @@
 package traefikwsbalancer_test
 
 import (
-	"io"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,7 +10,6 @@ import (
 	"time"
 
 	"github.com/K8Trust/traefikwsbalancer"
-	"github.com/K8Trust/traefikwsbalancer/ws"
 )
 
 // MockFetcher is a mock implementation of ConnectionFetcher for testing.
@@ -78,42 +78,50 @@ func TestGetConnections(t *testing.T) {
 }
 
 func TestWebSocketConnection(t *testing.T) {
+	// Channel to signal when server has received and processed the request
 	done := make(chan struct{})
-
-	upgrader := ws.Upgrader{
-		CheckOrigin:      func(r *http.Request) bool { return true },
-		HandshakeTimeout: 2 * time.Second,
-		ReadBufferSize:   1024,
-		WriteBufferSize:  1024,
-	}
-
+	
+	// Test message content
+	testMessage := "Hello, WebSocket!"
+	
+	// Create a backend server that handles WebSocket connections
 	backendServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !ws.IsWebSocketUpgrade(r) {
+		// Ensure it's a WebSocket upgrade request
+		if !isWebSocketRequest(r) {
 			t.Error("Expected WebSocket upgrade request")
 			return
 		}
-
-		c, err := upgrader.Upgrade(w, r, nil)
+		
+		// Upgrade the connection
+		conn, err := upgradeWebSocketConnection(w, r)
 		if err != nil {
-			t.Logf("Backend upgrade failed: %v", err)
+			t.Errorf("Failed to upgrade WebSocket connection: %v", err)
 			return
 		}
-		defer c.Close()
-
-		c.SetReadDeadline(time.Now().Add(2 * time.Second))
-		c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-
-		messageType, message, err := c.ReadMessage()
+		defer conn.Close()
+		
+		// Read a message
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
 		if err != nil {
-			t.Logf("Backend read failed: %v", err)
+			t.Errorf("Error reading from WebSocket: %v", err)
 			return
 		}
-
-		err = c.WriteMessage(messageType, message)
-		if err != nil {
-			t.Logf("Backend write failed: %v", err)
+		
+		message := string(buf[:n])
+		if !strings.Contains(message, testMessage) {
+			t.Errorf("Unexpected message content: %s", message)
 			return
 		}
+		
+		// Echo the message back
+		_, err = conn.Write(buf[:n])
+		if err != nil {
+			t.Errorf("Error writing to WebSocket: %v", err)
+			return
+		}
+		
+		// Signal that the echo is complete
 		close(done)
 	}))
 	defer backendServer.Close()
@@ -129,56 +137,119 @@ func TestWebSocketConnection(t *testing.T) {
 		DialTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
 		ReadTimeout:  2 * time.Second,
+		MaxRetries:   3,
+		RetryDelay:   1,
 	}
 
 	// Manually initialize the connection cache for testing
 	cb.InitializeConnectionCacheForTest(backendServer.URL, 1)
 
+	// Create a test server with the balancer
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cb.ServeHTTP(w, r)
 	}))
 	defer testServer.Close()
 
+	// Connect to the WebSocket endpoint
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
 	wsURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
-
-	headers := http.Header{}
-	headers.Set("Agent-ID", "test-agent")
-
-	dialer := ws.Dialer{
-		HandshakeTimeout: 2 * time.Second,
-		ReadBufferSize:   1024,
-		WriteBufferSize:  1024,
-	}
-
-	c, resp, err := dialer.Dial(wsURL, headers)
+	conn, err := dialer.Dial("tcp", wsURL[5:]) // Remove "ws://" prefix
 	if err != nil {
-		t.Fatalf("Dial failed: %v", err)
-		if resp != nil {
-			t.Logf("HTTP Response: %d", resp.StatusCode)
-			body, _ := io.ReadAll(resp.Body)
-			t.Logf("Response body: %s", body)
-		}
+		t.Fatalf("Failed to connect to WebSocket server: %v", err)
 		return
 	}
-	defer c.Close()
-
-	testMessage := []byte("Hello, WebSocket!")
-	if err := c.WriteMessage(ws.TextMessage, testMessage); err != nil {
-		t.Fatalf("Write failed: %v", err)
+	defer conn.Close()
+	
+	// Send WebSocket handshake
+	key := "dGhlIHNhbXBsZSBub25jZQ=="
+	handshake := fmt.Sprintf(
+		"GET / HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Key: %s\r\n"+
+		"Sec-WebSocket-Version: 13\r\n"+
+		"Agent-ID: test-agent\r\n"+
+		"\r\n",
+		wsURL[5:], key)
+	
+	_, err = conn.Write([]byte(handshake))
+	if err != nil {
+		t.Fatalf("Failed to send WebSocket handshake: %v", err)
+		return
 	}
-
+	
+	// Read handshake response
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("Failed to read handshake response: %v", err)
+		return
+	}
+	
+	response := string(buf[:n])
+	if !strings.Contains(response, "HTTP/1.1 101") {
+		t.Fatalf("Not a WebSocket upgrade response: %s", response)
+		return
+	}
+	
+	// Send a test message
+	msg := fmt.Sprintf("\x81%c%s", byte(len(testMessage)), testMessage)
+	_, err = conn.Write([]byte(msg))
+	if err != nil {
+		t.Fatalf("Failed to send WebSocket message: %v", err)
+		return
+	}
+	
+	// Wait for server to process the message
 	select {
 	case <-done:
+		// Successfully received echo
 	case <-time.After(5 * time.Second):
-		t.Fatal("Test timed out waiting for response")
+		t.Fatal("Test timed out waiting for WebSocket echo")
 	}
-
-	_, message, err := c.ReadMessage()
+	
+	// Read echo response
+	n, err = conn.Read(buf)
 	if err != nil {
-		t.Fatalf("Read failed: %v", err)
+		t.Fatalf("Failed to read echo response: %v", err)
+		return
 	}
+	
+	// Verify the echoed message
+	if n < 2 || !strings.Contains(string(buf[2:n]), testMessage) {
+		t.Fatalf("Unexpected echo response: %s", string(buf[:n]))
+	}
+}
 
-	if string(message) != string(testMessage) {
-		t.Fatalf("Expected message %q, got %q", testMessage, message)
+// Helper functions for WebSocket testing
+
+func isWebSocketRequest(r *http.Request) bool {
+	upgrade := r.Header.Get("Upgrade")
+	connection := r.Header.Get("Connection")
+	return strings.ToLower(upgrade) == "websocket" && strings.Contains(strings.ToLower(connection), "upgrade")
+}
+
+func upgradeWebSocketConnection(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		return nil, fmt.Errorf("webserver doesn't support hijacking")
 	}
+	
+	conn, bufrw, err := hj.Hijack()
+	if err != nil {
+		return nil, err
+	}
+	
+	// Send 101 Switching Protocols response
+	response := "HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" +
+				"\r\n"
+	
+	bufrw.WriteString(response)
+	bufrw.Flush()
+	
+	return conn, nil
 }

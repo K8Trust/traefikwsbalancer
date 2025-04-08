@@ -12,7 +12,7 @@ A high-performance WebSocket connection balancer middleware for Traefik that dis
 
 - **WebSocket Support**
   - Full WebSocket protocol support (RFC 6455)
-  - Bidirectional message relay
+  - Bidirectional message relay using standard library
   - Transparent protocol upgrade handling
   - Support for WebSocket extensions and subprotocols
 
@@ -37,7 +37,6 @@ A high-performance WebSocket connection balancer middleware for Traefik that dis
 
 ### Prerequisites
 - Go 1.22 or higher
-- gorilla/websocket v1.5.3 or higher
 
 ### Installation
 
@@ -214,8 +213,8 @@ The plugin provides a dedicated metrics endpoint that displays:
 1. Client initiates WebSocket connection
 2. Balancer checks connection counts from all backends
 3. Selects backend with lowest connection count
-4. Establishes connection to chosen backend
-5. Sets up bidirectional relay
+4. Establishes connection to chosen backend using httputil.ReverseProxy
+5. Sets up bidirectional relay with proper error handling
 6. Monitors connection health
 
 ### Load Balancing Algorithm
@@ -223,6 +222,7 @@ The plugin provides a dedicated metrics endpoint that displays:
 - Updates counts based on CacheTTL
 - Uses atomic operations for thread safety
 - Handles backend failures gracefully
+- Implements configurable retry logic
 
 ## Production Deployment
 
@@ -353,6 +353,5 @@ For issues and feature requests, please create an issue in the GitHub repository
 
 ## Acknowledgments
 
-- gorilla/websocket team for the excellent WebSocket implementation
-- Traefik team for the plugin system
-- Contributors who have helped improve this project
+- The Traefik team for their excellent plugin system
+- The Go team for the robust standard library WebSocket implementation

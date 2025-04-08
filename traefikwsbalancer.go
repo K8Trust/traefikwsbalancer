@@ -1,12 +1,16 @@
 package traefikwsbalancer
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +35,10 @@ type Config struct {
 	EnableIPScanning bool `json:"enableIPScanning" yaml:"enableIPScanning"`
 	// DiscoveryTimeout is the timeout (in seconds) for pod discovery requests.
 	DiscoveryTimeout int `json:"discoveryTimeout" yaml:"discoveryTimeout"`
+	// MaxRetries is the maximum number of retries for metrics collection
+	MaxRetries int `json:"maxRetries" yaml:"maxRetries"`
+	// RetryDelay is the delay between retries in seconds
+	RetryDelay int `json:"retryDelay" yaml:"retryDelay"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -40,7 +48,9 @@ func CreateConfig() *Config {
 		BalancerMetricPath: "/balancer-metrics",
 		CacheTTL:           30, // 30 seconds default
 		EnableIPScanning:   false,
-		DiscoveryTimeout:   2, // 2 seconds default for discovery requests
+		DiscoveryTimeout:   5, // 5 seconds default for discovery requests
+		MaxRetries:         3, // 3 retries default
+		RetryDelay:         1, // 1 second delay between retries
 	}
 }
 
@@ -68,8 +78,10 @@ type Balancer struct {
 	updateMutex sync.Mutex
 
 	// New fields for discovery configuration.
-	EnableIPScanning bool
-	DiscoveryTimeout time.Duration
+	EnableIPScanning   bool
+	DiscoveryTimeout   time.Duration
+	MaxRetries         int
+	RetryDelay         int
 }
 
 // New creates a new plugin instance.
@@ -96,6 +108,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		ReadTimeout:        30 * time.Second,
 		EnableIPScanning:   config.EnableIPScanning,
 		DiscoveryTimeout:   time.Duration(config.DiscoveryTimeout) * time.Second,
+		MaxRetries:         config.MaxRetries,
+		RetryDelay:         config.RetryDelay,
 	}
 	// Start asynchronous background cache refresh.
 	b.StartBackgroundRefresh()
@@ -166,21 +180,23 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	}
 	
 	// STRATEGY 1: Try to use Kubernetes Endpoints API
-	// This is the most reliable way to get all pods behind a service
 	log.Printf("[DEBUG] Attempting to discover pods using Kubernetes Endpoints API for %s.%s", serviceName, namespace)
 	
 	// Construct the endpoint URL for the Kubernetes API
-	// First try accessing the endpoints object directly through service
 	endpointsURLs := []string{
 		fmt.Sprintf("%s/endpoints", service),                          // Custom endpoints API provided by the service
 		fmt.Sprintf("http://kubernetes.default.svc/api/v1/namespaces/%s/endpoints/%s", namespace, serviceName), // K8s API direct
 	}
+	
+	var allPodMetrics []dashboard.PodMetrics
+	var discoveryErrors []string
 	
 	for _, endpointsURL := range endpointsURLs {
 		log.Printf("[DEBUG] Trying endpoints URL: %s", endpointsURL)
 		endpointsResp, err := discoveryClient.Get(endpointsURL)
 		if err != nil {
 			log.Printf("[DEBUG] Failed to fetch endpoints from %s: %v", endpointsURL, err)
+			discoveryErrors = append(discoveryErrors, fmt.Sprintf("Failed to fetch from %s: %v", endpointsURL, err))
 			continue
 		}
 		
@@ -188,6 +204,7 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 		endpointsBody, err := io.ReadAll(endpointsResp.Body)
 		if err != nil {
 			log.Printf("[DEBUG] Failed to read endpoints response: %v", err)
+			discoveryErrors = append(discoveryErrors, fmt.Sprintf("Failed to read response from %s: %v", endpointsURL, err))
 			continue
 		}
 		
@@ -212,7 +229,6 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 		
 		if err := json.Unmarshal(endpointsBody, &endpoints); err == nil && len(endpoints.Subsets) > 0 {
 			log.Printf("[DEBUG] Successfully parsed Kubernetes Endpoints object")
-			allPodMetrics := []dashboard.PodMetrics{}
 			
 			// Process all pod addresses
 			for _, subset := range endpoints.Subsets {
@@ -227,231 +243,74 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 						podName = address.TargetRef.Name
 					}
 					
-					// Fetch metrics from each pod
+					// Fetch metrics from each pod with retries
 					podURL := fmt.Sprintf("http://%s:%d%s", address.IP, port, b.MetricPath)
 					log.Printf("[DEBUG] Fetching metrics from pod %s at %s", podName, podURL)
 					
-					podResp, err := discoveryClient.Get(podURL)
-					if err != nil {
-						log.Printf("[WARN] Failed to fetch metrics from pod %s: %v", podName, err)
-						continue
-					}
-					
-					defer podResp.Body.Close()
-					podBody, err := io.ReadAll(podResp.Body)
-					if err != nil {
-						log.Printf("[WARN] Failed to read response from pod %s: %v", podName, err)
-						continue
-					}
-					
 					var podMetrics dashboard.PodMetrics
-					if err := json.Unmarshal(podBody, &podMetrics); err != nil {
-						log.Printf("[WARN] Failed to parse metrics from pod %s: %v", podName, err)
+					var metricsErr error
+					
+					// Implement retry logic
+					for retry := 0; retry < b.MaxRetries; retry++ {
+						if retry > 0 {
+							log.Printf("[DEBUG] Retry %d/%d for pod %s", retry, b.MaxRetries, podName)
+							time.Sleep(time.Duration(b.RetryDelay) * time.Second)
+						}
+						
+						podResp, err := discoveryClient.Get(podURL)
+						if err != nil {
+							metricsErr = err
+							continue
+						}
+						
+						podBody, err := io.ReadAll(podResp.Body)
+						podResp.Body.Close()
+						if err != nil {
+							metricsErr = err
+							continue
+						}
+						
+						if err := json.Unmarshal(podBody, &podMetrics); err != nil {
+							metricsErr = err
+							continue
+						}
+						
+						// Successfully got metrics
+						metricsErr = nil
+						break
+					}
+					
+					if metricsErr != nil {
+						log.Printf("[WARN] Failed to fetch metrics from pod %s after %d retries: %v", podName, b.MaxRetries, metricsErr)
+						discoveryErrors = append(discoveryErrors, fmt.Sprintf("Failed to fetch metrics from pod %s: %v", podName, metricsErr))
 						continue
 					}
 					
-					// Ensure pod name is set
+					// Add pod IP and name if not set
+					if podMetrics.PodIP == "" {
+						podMetrics.PodIP = address.IP
+					}
 					if podMetrics.PodName == "" {
 						podMetrics.PodName = podName
 					}
 					
-					// Add to our metrics collection
 					allPodMetrics = append(allPodMetrics, podMetrics)
-					log.Printf("[DEBUG] Successfully fetched metrics from pod %s: %d connections", 
-						podName, podMetrics.AgentsConnections)
 				}
 			}
 			
+			// If we found any pods, return them even if some failed
 			if len(allPodMetrics) > 0 {
-				log.Printf("[INFO] Successfully discovered %d pods for service %s using Endpoints API", 
-					len(allPodMetrics), serviceName)
 				return allPodMetrics, nil
 			}
-		} else {
-			log.Printf("[DEBUG] Response is not a standard Kubernetes Endpoints object: %v", err)
-			
-			// Try parsing as a custom endpoints format
-			var customEndpoints struct {
-				Pods []struct {
-					Name string `json:"name"`
-					IP   string `json:"ip"`
-				} `json:"pods"`
-			}
-			
-			if err := json.Unmarshal(endpointsBody, &customEndpoints); err == nil && len(customEndpoints.Pods) > 0 {
-				log.Printf("[DEBUG] Successfully parsed custom Endpoints format with %d pods", len(customEndpoints.Pods))
-				allPodMetrics := []dashboard.PodMetrics{}
-				
-				for _, pod := range customEndpoints.Pods {
-					podURL := fmt.Sprintf("http://%s%s", pod.IP, b.MetricPath)
-					log.Printf("[DEBUG] Fetching metrics from pod %s at %s", pod.Name, podURL)
-					
-					podResp, err := discoveryClient.Get(podURL)
-					if err != nil {
-						log.Printf("[WARN] Failed to fetch metrics from pod %s: %v", pod.Name, err)
-						continue
-					}
-					
-					defer podResp.Body.Close()
-					podBody, err := io.ReadAll(podResp.Body)
-					if err != nil {
-						log.Printf("[WARN] Failed to read response from pod %s: %v", pod.Name, err)
-						continue
-					}
-					
-					var podMetrics dashboard.PodMetrics
-					if err := json.Unmarshal(podBody, &podMetrics); err != nil {
-						log.Printf("[WARN] Failed to parse metrics from pod %s: %v", pod.Name, err)
-						continue
-					}
-					
-					// Ensure pod name is set
-					if podMetrics.PodName == "" {
-						podMetrics.PodName = pod.Name
-					}
-					
-					// Add to our metrics collection
-					allPodMetrics = append(allPodMetrics, podMetrics)
-					log.Printf("[DEBUG] Successfully fetched metrics from pod %s: %d connections", 
-						pod.Name, podMetrics.AgentsConnections)
-				}
-				
-				if len(allPodMetrics) > 0 {
-					log.Printf("[INFO] Successfully discovered %d pods for service %s using custom Endpoints format", 
-						len(allPodMetrics), serviceName)
-					return allPodMetrics, nil
-				}
-			}
 		}
 	}
 	
-	// STRATEGY 2: Fall back to DNS with IP scanning if enabled
-	if b.EnableIPScanning {
-		log.Printf("[DEBUG] Attempting to discover pods using IP scanning for service %s", serviceName)
-		
-		// Fetch metrics from the service first to get info about at least one pod
-		resp, err := b.Client.Get(service + b.MetricPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch initial pod metrics: %v", err)
-		}
-		defer resp.Body.Close()
-		
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read initial pod metrics: %v", err)
-		}
-		
-		var initialPodMetrics dashboard.PodMetrics
-		if err := json.Unmarshal(body, &initialPodMetrics); err != nil {
-			log.Printf("[DEBUG] Failed to decode as pod metrics, trying legacy format: %v", err)
-			var legacyMetrics struct {
-				AgentsConnections int `json:"agentsConnections"`
-			}
-			if err := json.Unmarshal(body, &legacyMetrics); err != nil {
-				return nil, fmt.Errorf("failed to decode metrics: %v", err)
-			}
-			
-			dummyPod := dashboard.PodMetrics{
-				AgentsConnections: legacyMetrics.AgentsConnections,
-			}
-			return []dashboard.PodMetrics{dummyPod}, nil
-		}
-		
-		// If no pod info is available, return just this one metric
-		if initialPodMetrics.PodName == "" || initialPodMetrics.PodIP == "" {
-			return []dashboard.PodMetrics{initialPodMetrics}, nil
-		}
-		
-		// Use the pod name to infer the deployment name
-		podName := initialPodMetrics.PodName
-		parts := strings.Split(podName, "-")
-		if len(parts) < 2 {
-			return []dashboard.PodMetrics{initialPodMetrics}, nil
-		}
-		
-		// Now try to scan similar IP ranges
-		podIP := initialPodMetrics.PodIP
-		ipParts := strings.Split(podIP, ".")
-		if len(ipParts) != 4 {
-			// Not a valid IPv4 address
-			return []dashboard.PodMetrics{initialPodMetrics}, nil
-		}
-		
-		// We have one pod IP, let's try to scan the nearby IPs
-		// Assuming pods are in the same subnet
-		baseIP := strings.Join(ipParts[:3], ".") // e.g. "100.68.32"
-		allPodMetrics := []dashboard.PodMetrics{initialPodMetrics}
-		
-		// Scan a limited range of IPs
-		for i := 1; i <= 20; i++ {
-			testIP := fmt.Sprintf("%s.%d", baseIP, i)
-			if testIP == podIP {
-				continue // Skip the IP we already know
-			}
-			
-			podURL := fmt.Sprintf("http://%s%s", testIP, b.MetricPath)
-			log.Printf("[DEBUG] Trying to reach potential pod at %s", podURL)
-			
-			podResp, err := discoveryClient.Get(podURL)
-			if err != nil {
-				continue // Skip unreachable IPs
-			}
-			
-			defer podResp.Body.Close()
-			podBody, err := io.ReadAll(podResp.Body)
-			if err != nil {
-				continue
-			}
-			
-			var podMetrics dashboard.PodMetrics
-			if err := json.Unmarshal(podBody, &podMetrics); err != nil {
-				continue
-			}
-			
-			// Check if this looks like a pod from the same deployment
-			if podMetrics.PodName != "" && strings.HasPrefix(podMetrics.PodName, parts[0]) {
-				log.Printf("[DEBUG] Discovered additional pod %s via IP scanning", podMetrics.PodName)
-				allPodMetrics = append(allPodMetrics, podMetrics)
-			}
-		}
-		
-		log.Printf("[INFO] Discovered %d pods for service %s via IP scanning", len(allPodMetrics), serviceName)
-		return allPodMetrics, nil
+	// If we got here, we couldn't discover any pods
+	if len(discoveryErrors) > 0 {
+		return nil, fmt.Errorf("pod discovery failed: %s", strings.Join(discoveryErrors, "; "))
 	}
 	
-	// STRATEGY 3: Last resort - just query the service once
-	// If we reach here, we couldn't discover individual pods, so just get metrics from the service
-	log.Printf("[DEBUG] Falling back to getting metrics directly from service %s", service)
-	resp, err := b.Client.Get(service + b.MetricPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch service metrics: %v", err)
-	}
-	defer resp.Body.Close()
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read service metrics: %v", err)
-	}
-	
-	var podMetrics dashboard.PodMetrics
-	if err := json.Unmarshal(body, &podMetrics); err != nil {
-		var legacyMetrics struct {
-			AgentsConnections int `json:"agentsConnections"`
-		}
-		if err := json.Unmarshal(body, &legacyMetrics); err != nil {
-			return nil, fmt.Errorf("failed to decode metrics: %v", err)
-		}
-		
-		dummyPod := dashboard.PodMetrics{
-			AgentsConnections: legacyMetrics.AgentsConnections,
-		}
-		log.Printf("[DEBUG] Using legacy format metrics from service %s: %d connections", 
-			service, dummyPod.AgentsConnections)
-		return []dashboard.PodMetrics{dummyPod}, nil
-	}
-	
-	log.Printf("[DEBUG] Using metrics from service %s: %d connections", service, podMetrics.AgentsConnections)
-	return []dashboard.PodMetrics{podMetrics}, nil
+	return nil, fmt.Errorf("no pods discovered for service %s", service)
 }
 
 // getCachedConnections returns the cached connection count for a service.
@@ -716,93 +575,109 @@ func (b *Balancer) handleHTMLMetricRequest(rw http.ResponseWriter, req *http.Req
 
 // handleWebSocket proxies WebSocket connections.
 func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, targetService string) {
-	dialer := ws.Dialer{
-		HandshakeTimeout: b.DialTimeout,
-		ReadBufferSize:   1024,
-		WriteBufferSize:  1024,
-	}
+	log.Printf("[DEBUG] Handling WebSocket connection to %s", targetService)
 
-	targetURL := "ws" + strings.TrimPrefix(targetService, "http") + req.URL.Path
-	if req.URL.RawQuery != "" {
-		targetURL += "?" + req.URL.RawQuery
-	}
-
-	log.Printf("[DEBUG] Dialing backend WebSocket service at %s", targetURL)
-
-	cleanHeaders := make(http.Header)
-	for k, v := range req.Header {
-		switch k {
-		case "Upgrade", "Connection", "Sec-Websocket-Key",
-			"Sec-Websocket-Version", "Sec-Websocket-Extensions",
-			"Sec-Websocket-Protocol":
-			continue
-		default:
-			cleanHeaders[k] = v
-		}
-	}
-
-	backendConn, resp, err := dialer.Dial(targetURL, cleanHeaders)
+	// Use standard library's reverse proxy for WebSocket
+	backendURL, err := url.Parse(targetService)
 	if err != nil {
-		log.Printf("[ERROR] Failed to connect to backend WebSocket: %v", err)
-		if resp != nil {
-			copyHeaders(rw.Header(), resp.Header)
-			rw.WriteHeader(resp.StatusCode)
-		} else {
-			http.Error(rw, "Failed to connect to backend", http.StatusBadGateway)
-		}
+		log.Printf("[ERROR] Failed to parse target service URL: %v", err)
+		http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	defer backendConn.Close()
 
-	upgrader := ws.Upgrader{
-		HandshakeTimeout: b.DialTimeout,
-		ReadBufferSize:   1024,
-		WriteBufferSize:  1024,
-		CheckOrigin:      func(r *http.Request) bool { return true },
-	}
-
-	clientConn, err := upgrader.Upgrade(rw, req, nil)
-	if err != nil {
-		log.Printf("[ERROR] Failed to upgrade client connection: %v", err)
-		return
-	}
-	defer clientConn.Close()
-
-	clientDone := make(chan struct{})
-	backendDone := make(chan struct{})
-
-	go func() {
-		defer close(clientDone)
-		for {
-			messageType, message, err := clientConn.ReadMessage()
-			if err != nil {
-				return
-			}
-			err = backendConn.WriteMessage(messageType, message)
-			if err != nil {
-				return
+	// Create a reverse proxy
+	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+	
+	// Set up the director to modify the request
+	originalDirector := proxy.Director
+	proxy.Director = func(r *http.Request) {
+		originalDirector(r)
+		r.URL.Path = req.URL.Path
+		r.URL.RawQuery = req.URL.RawQuery
+		
+		// Copy all headers except those that would be added by the http.ReverseProxy
+		for k, vv := range req.Header {
+			if k != "Connection" && k != "Upgrade" && 
+			   !strings.HasPrefix(k, "Sec-Websocket") {
+				r.Header[k] = vv
 			}
 		}
-	}()
-
-	go func() {
-		defer close(backendDone)
-		for {
-			messageType, message, err := backendConn.ReadMessage()
-			if err != nil {
-				return
-			}
-			err = clientConn.WriteMessage(messageType, message)
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	select {
-	case <-clientDone:
-	case <-backendDone:
+		
+		// Set required WebSocket headers
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Upgrade", "websocket")
 	}
+	
+	// Configure proxy behavior
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			log.Printf("[WARN] Backend did not upgrade connection: %s", resp.Status)
+		}
+		return nil
+	}
+	
+	// Standard error handling
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		log.Printf("[ERROR] Proxy error: %v", err)
+		http.Error(rw, "Service Unavailable", http.StatusServiceUnavailable)
+	}
+	
+	// Handle retries in case of connection failure
+	maxRetries := b.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	
+	var proxyErr error
+	for retry := 0; retry <= maxRetries; retry++ {
+		// Create a special response writer to capture the status code
+		statusRecorder := &statusRecorder{
+			ResponseWriter: rw,
+			status:         http.StatusOK,
+		}
+		
+		if retry > 0 {
+			log.Printf("[DEBUG] Retry %d/%d for WebSocket connection", retry, maxRetries)
+			time.Sleep(time.Duration(b.RetryDelay) * time.Second)
+		}
+		
+		// Serve the request
+		proxy.ServeHTTP(statusRecorder, req)
+		
+		// If the status code is not an error or if it's 101 (switching protocols), we're done
+		if statusRecorder.status < 400 || statusRecorder.status == http.StatusSwitchingProtocols {
+			log.Printf("[DEBUG] WebSocket connection established with status %d", statusRecorder.status)
+			return
+		}
+		
+		log.Printf("[WARN] WebSocket attempt %d failed with status %d", retry+1, statusRecorder.status)
+		proxyErr = fmt.Errorf("backend returned status %d", statusRecorder.status)
+	}
+	
+	// If we get here, all retries failed
+	log.Printf("[ERROR] WebSocket connection failed after %d retries: %v", maxRetries, proxyErr)
+	http.Error(rw, "Service Unavailable", http.StatusServiceUnavailable)
+}
+
+// statusRecorder is a wrapper for http.ResponseWriter that captures the status code
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+// WriteHeader captures the status code before passing it to the wrapped ResponseWriter
+func (r *statusRecorder) WriteHeader(statusCode int) {
+	r.status = statusCode
+	r.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Hijack implements the http.Hijacker interface to support WebSocket upgrades
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
 }
 
 // handleHTTP proxies regular HTTP requests.
