@@ -1,56 +1,81 @@
 #!/bin/bash
 
-# Create a text-based diagram that we'll convert to an image
-cat > diagram.txt << 'EOF'
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                     Traefik WebSocket Connection Balancer                              │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                        │
-│   ┌───────────┐          ┌──────────────────────────────┐         ┌─────────────────┐  │
-│   │           │          │       Traefik Proxy          │         │                 │  │
-│   │  Client   │  ──────> │ ┌────────────────────────┐   │ ──────> │ Metrics         │  │
-│   │ Browser/  │  WebSock │ │ WebSocket Connection   │   │  JSON   │ Endpoint        │  │
-│   │   App     │          │ │      Balancer          │   │         │ /balancer-      │  │
-│   │           │          │ └────────────────────────┘   │         │ metrics         │  │
-│   └───────────┘          └──────────────────────────────┘         └─────────────────┘  │
-│                                        │                                                │
-│            Routes to service with lowest connection count                               │
-│                                        │                                                │
-│                                        ▼                                                │
-│   ┌─────────────┐       ┌─────────────────────────┐      ┌─────────────────┐           │
-│   │ Backend 1   │       │     Backend 2           │      │   Backend 3     │           │
-│   │ ┌─────┐┌───┐│       │ ┌─────┐┌────┐┌─────┐    │      │ ┌─────┐┌─────┐  │           │
-│   │ │Pod 1││Pod││       │ │Pod 1││Pod2││Pod 3│    │      │ │Pod 1││Pod 2│  │           │
-│   │ │     ││ 2 ││       │ │     ││    ││     │    │      │ │     ││     │  │           │
-│   │ └─────┘└───┘│       │ └─────┘└────┘└─────┘    │      │ └─────┘└─────┘  │           │
-│   └─────────────┘       └─────────────────────────┘      └─────────────────┘           │
-│        │                           │                             │                      │
-│        │                           │                             │                      │
-│        │                           │                             │                      │
-│        └───────────────────────────┼─────────────────────────────┘                      │
-│                                    │                                                    │
-│                                    ▼                                                    │
-│   ┌────────────────────────────────────────────────┐   ┌───────────────────────────┐   │
-│   │        Connection Count Collection             │   │     Pod Discovery         │   │
-│   │  1. Direct Service Metrics (/metric)           │──>│     Methods:              │   │
-│   │  2. Pod Discovery via IP Scanning              │   │  1. Endpoints API         │   │
-│   │  3. Connection Count Caching                   │   │  2. Direct DNS            │   │
-│   └────────────────────────────────────────────────┘   │  3. IP Scanning (±5 3rd   │   │
-│                                                        │     octet, e.g. 100.68.X.Y)│   │
-│                                                        └───────────────────────────┘   │
-│   IP Scanning finds pods across different subnets                                      │
-│   Example: Discovers 100.68.32.4 and 100.68.36.4                                       │
-└────────────────────────────────────────────────────────────────────────────────────────┘
+# This script attempts to convert the SVG diagram to PNG using several methods
+# One of these methods should work on most systems
+
+echo "Converting diagram.svg to diagram.png..."
+
+# Method 1: Try using ImageMagick
+if command -v convert &> /dev/null; then
+    echo "Attempting conversion with ImageMagick..."
+    convert diagram.svg diagram.png
+    if [ -f diagram.png ]; then
+        echo "Success! Created diagram.png using ImageMagick"
+        exit 0
+    fi
+fi
+
+# Method 2: Try using rsvg-convert
+if command -v rsvg-convert &> /dev/null; then
+    echo "Attempting conversion with rsvg-convert..."
+    rsvg-convert -o diagram.png diagram.svg
+    if [ -f diagram.png ]; then
+        echo "Success! Created diagram.png using rsvg-convert"
+        exit 0
+    fi
+fi
+
+# Method 3: Try using Chrome/Chromium headless
+if command -v chrome &> /dev/null || command -v chromium &> /dev/null || command -v chromium-browser &> /dev/null; then
+    CHROME_CMD=""
+    if command -v chrome &> /dev/null; then
+        CHROME_CMD="chrome"
+    elif command -v chromium &> /dev/null; then
+        CHROME_CMD="chromium"
+    else
+        CHROME_CMD="chromium-browser"
+    fi
+    
+    echo "Attempting conversion with $CHROME_CMD headless..."
+    $CHROME_CMD --headless --screenshot=diagram.png file://$(pwd)/diagram.svg
+    if [ -f diagram.png ]; then
+        echo "Success! Created diagram.png using $CHROME_CMD headless"
+        exit 0
+    fi
+fi
+
+# Method 4: Try using Python with svglib
+echo "Attempting conversion with Python/svglib..."
+cat > convert_svg.py << 'EOF'
+try:
+    from svglib.svglib import svg2rlg
+    from reportlab.graphics import renderPM
+    drawing = svg2rlg('diagram.svg')
+    renderPM.drawToFile(drawing, 'diagram.png', fmt='PNG')
+    print("Success! Created diagram.png using Python/svglib")
+except ImportError:
+    print("Error: Required Python packages not installed")
+    print("Install with: pip install svglib reportlab")
 EOF
 
-# Display the diagram in the terminal
-cat diagram.txt
+python3 convert_svg.py 2>/dev/null || python convert_svg.py 2>/dev/null
 
-# Try to convert to PNG if possible using terminal2image
-if command -v npm > /dev/null; then
-  npm install -g terminal-to-image
-  terminal-to-image diagram.txt diagram.png
-  echo "Diagram saved as diagram.png"
-else
-  echo "Diagram saved as diagram.txt. Install terminal-to-image via npm to convert to PNG"
-fi 
+if [ -f diagram.png ]; then
+    echo "Success! Created diagram.png"
+    rm convert_svg.py
+    exit 0
+fi
+
+# If all else fails, provide manual instructions
+echo "Unable to automatically convert SVG to PNG."
+echo "To manually convert diagram.svg to PNG:"
+echo "1. Open diagram.svg in a web browser"
+echo "2. Take a screenshot or use browser's save functionality"
+echo "3. Save as diagram.png in this directory"
+echo ""
+echo "Or install one of these tools and run this script again:"
+echo "- ImageMagick: https://imagemagick.org"
+echo "- librsvg (rsvg-convert): https://wiki.gnome.org/Projects/LibRsvg"
+echo "- Python with svglib: pip install svglib reportlab"
+
+exit 1 

@@ -247,13 +247,20 @@ The plugin provides a dedicated metrics endpoint that displays:
 6. Monitors connection health
 
 ### Pod Discovery and Load Balancing
-1. Initial metrics request identifies at least one pod
+1. Initial metrics request identifies at least one pod in the service
 2. Discovery mechanisms attempt to find all related pods:
    - First tries the endpoints API
    - Then attempts direct DNS discovery
    - Finally uses IP scanning (if enabled)
-3. All discovered pods contribute to the service's total connections
-4. Clients are directed to the pod with the fewest connections
+3. All discovered pods report their individual connection counts
+4. The balancer selects the specific pod with the fewest connections
+5. Traffic is routed directly to that pod's IP address, not to the Kubernetes service
+
+This approach differs from standard Kubernetes service routing by:
+- Bypassing Kubernetes load balancing (which is random/round-robin)
+- Making connection decisions based on actual connection load
+- Creating a direct connection to a specific pod
+- Avoiding overloading any single pod with too many connections
 
 ### Architecture Diagram
 
@@ -261,10 +268,12 @@ The plugin provides a dedicated metrics endpoint that displays:
 
 The diagram illustrates the flow of WebSocket connections through the balancer:
 1. Clients connect to Traefik via WebSocket
-2. The balancer middleware selects the service with the lowest connection count
-3. Connection metrics are collected from all services
-4. Pod discovery mechanisms find all pods behind each service
-5. IP scanning allows finding pods across different subnets
+2. The balancer middleware identifies all pods behind the service
+3. Connection metrics are collected from individual pods
+4. The pod with the lowest connection count is selected
+5. Traffic is routed directly to the selected pod's IP address
+
+> **Note**: If your browser or viewer doesn't support SVG, you can view the [PNG version of the diagram](diagram.png) instead.
 
 ## Production Deployment
 
