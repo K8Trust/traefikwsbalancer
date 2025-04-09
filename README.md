@@ -38,7 +38,7 @@ A high-performance WebSocket connection balancer middleware for Traefik that dis
 
 ### Prerequisites
 - Go 1.22 or higher
-- gorilla/websocket v1.5.3 or higher
+- /websocket v1.5.3 or higher
 
 ### Installation
 
@@ -255,6 +255,17 @@ The plugin provides a dedicated metrics endpoint that displays:
 3. All discovered pods contribute to the service's total connections
 4. Clients are directed to the pod with the fewest connections
 
+### Architecture Diagram
+
+![Traefik WebSocket Connection Balancer Architecture](diagram.svg)
+
+The diagram illustrates the flow of WebSocket connections through the balancer:
+1. Clients connect to Traefik via WebSocket
+2. The balancer middleware selects the service with the lowest connection count
+3. Connection metrics are collected from all services
+4. Pod discovery mechanisms find all pods behind each service
+5. IP scanning allows finding pods across different subnets
+
 ## Production Deployment
 
 ### Best Practices
@@ -342,6 +353,5 @@ For issues and feature requests, please create an issue in the GitHub repository
 
 ## Acknowledgments
 
-- gorilla/websocket team for the excellent WebSocket implementation
 - Traefik team for the plugin system
 - Contributors who have helped improve this project
