@@ -1,6 +1,7 @@
 package traefikwsbalancer_test
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -56,8 +57,29 @@ func TestGetConnections(t *testing.T) {
 			}
 
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Test proper headers are sent
+				if r.Header.Get("User-Agent") != "TraefikWSBalancer/1.0" {
+					t.Logf("Missing or incorrect User-Agent header: %s", r.Header.Get("User-Agent"))
+				}
+				if r.Header.Get("Accept") != "application/json" {
+					t.Logf("Missing or incorrect Accept header: %s", r.Header.Get("Accept"))
+				}
+				
+				// Return Node.js style response format
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"agentsConnections": 5}`))
+				
+				// Mimic the Node.js server response format
+				response := map[string]interface{}{
+					"agentsConnections": tt.connections,
+					"podName": "test-pod-1",
+					"podIP": "10.0.0.1",
+					"nodeName": "test-node-1",
+					"totalConnectionsReceived": 10,
+					"activeConnections": []string{"agent1", "agent2"}
+				}
+				
+				json.NewEncoder(w).Encode(response)
 			}))
 			defer server.Close()
 
