@@ -61,7 +61,7 @@ func TestGetConnections(t *testing.T) {
 			}))
 			defer server.Close()
 
-			connections, err := cb.GetConnections(server.URL)
+			connections, _, err := cb.GetConnections(server.URL)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetConnections() error = %v, wantErr %v", err, tt.wantErr)
 				return

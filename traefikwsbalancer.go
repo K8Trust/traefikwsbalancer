@@ -202,10 +202,6 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	}
 	headlessServiceName := serviceParts[0]
 	_ = headlessServiceName // currently not used further
-	namespace := "default"
-	if len(serviceParts) > 1 {
-		namespace = serviceParts[1]
-	}
 
 	// Create a dedicated discovery client with a shorter timeout.
 	discoveryClient := &http.Client{Timeout: b.DiscoveryTimeout}
@@ -414,9 +410,19 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	for _, service := range b.Services {
 		connections, err := b.getCachedConnections(service)
 		if err != nil {
-			log.Printf("[ERROR] Failed to get connections for service %s: %v", service, err)
-			continue
+			log.Printf("[WARN] Cache miss for service %s: %v. Attempting direct fetch.", service, err)
+			// Attempt to fetch directly if cache lookup fails
+			connCount, _, fetchErr := b.GetConnections(service)
+			if fetchErr != nil {
+				log.Printf("[ERROR] Failed to fetch connections directly for service %s: %v", service, fetchErr)
+				continue // Skip this service if direct fetch also fails
+			}
+			log.Printf("[DEBUG] Successfully fetched connections directly for service %s: %d", service, connCount)
+			connections = connCount
+			// Optionally store the fetched value back in the cache
+			b.connCache.Store(service, connections)
 		}
+
 		allServiceConnections[service] = connections
 		log.Printf("[DEBUG] Service %s has %d active connections", service, connections)
 		if connections < minConnections {
