@@ -13,33 +13,96 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"bytes"
 )
 
 const (
 	TextMessage   = 1
 	BinaryMessage = 2
 	CloseMessage  = 8
+	PingMessage   = 9
+	PongMessage   = 10
 )
 
 // Conn is a minimal WebSocket connection.
 type Conn struct {
 	conn net.Conn
 	br   *bufio.Reader
+	// The negotiated subprotocol
+	Subprotocol string
 }
 
-// ReadMessage reads a line (ending in '\n') and returns it as a text message.
+// ReadMessage reads a message from the connection.
+// For simplicity in this implementation, it treats all messages as either text or binary.
 func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
-	line, err := c.br.ReadString('\n')
+	line, err := c.br.ReadBytes('\n')
 	if err != nil {
 		return 0, nil, err
 	}
-	return TextMessage, []byte(strings.TrimSuffix(line, "\n")), nil
+	
+	// Basic frame type detection - in a real implementation this would parse the WebSocket frame format
+	if len(line) > 0 && line[0] == 0x02 {
+		// Simple marker for binary data in our simplified implementation
+		return BinaryMessage, bytes.TrimSuffix(line[1:], []byte{'\n'}), nil
+	}
+	
+	// Check for close frame (simplified)
+	if len(line) > 0 && line[0] == 0x08 {
+		return CloseMessage, nil, nil
+	}
+	
+	// Detect ping/pong (simplified)
+	if len(line) > 0 && line[0] == 0x09 {
+		return PingMessage, bytes.TrimSuffix(line[1:], []byte{'\n'}), nil
+	}
+	if len(line) > 0 && line[0] == 0x0A {
+		return PongMessage, bytes.TrimSuffix(line[1:], []byte{'\n'}), nil
+	}
+	
+	// Default to text message
+	return TextMessage, bytes.TrimSuffix(line, []byte{'\n'}), nil
 }
 
-// WriteMessage writes data followed by a newline.
+// WriteMessage writes a message to the connection.
 func (c *Conn) WriteMessage(messageType int, data []byte) error {
-	_, err := c.conn.Write(append(data, '\n'))
+	var msgData []byte
+	
+	switch messageType {
+	case BinaryMessage:
+		// Add a simple marker for binary data in our simplified implementation
+		msgData = append([]byte{0x02}, data...)
+	case CloseMessage:
+		// Simple close frame
+		msgData = append([]byte{0x08}, data...)
+	case PingMessage:
+		msgData = append([]byte{0x09}, data...)
+	case PongMessage:
+		msgData = append([]byte{0x0A}, data...)
+	default: // TextMessage or unknown
+		msgData = data
+	}
+	
+	// Ensure message ends with newline for our simplified protocol
+	if !bytes.HasSuffix(msgData, []byte{'\n'}) {
+		msgData = append(msgData, '\n')
+	}
+	
+	_, err := c.conn.Write(msgData)
 	return err
+}
+
+// WriteControl writes a control message with the given deadline.
+func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) error {
+	if messageType != CloseMessage && messageType != PingMessage && messageType != PongMessage {
+		return errors.New("invalid control message type")
+	}
+	
+	err := c.conn.SetWriteDeadline(deadline)
+	if err != nil {
+		return err
+	}
+	
+	return c.WriteMessage(messageType, data)
 }
 
 // SetReadDeadline sets the read deadline on the underlying connection.
@@ -71,6 +134,10 @@ type Upgrader struct {
 	WriteBufferSize  int
 	// CheckOrigin is called to validate the request origin.
 	CheckOrigin func(r *http.Request) bool
+	// Subprotocols specifies the server's supported protocols in order of preference.
+	// If this field is not nil and the client requested subprotocols, then the
+	// first match will be chosen.
+	Subprotocols []string
 }
 
 // Upgrade upgrades an HTTP connection to a WebSocket.
@@ -87,11 +154,44 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return nil, errors.New("missing Sec-WebSocket-Key")
 	}
+	
+	// Handle subprotocols if specified
+	if len(u.Subprotocols) > 0 {
+		clientProtocols := r.Header.Get("Sec-WebSocket-Protocol")
+		if clientProtocols != "" {
+			clientProtos := strings.Split(clientProtocols, ", ")
+			for _, serverProto := range u.Subprotocols {
+				for _, clientProto := range clientProtos {
+					if clientProto == serverProto {
+						responseHeader.Set("Sec-WebSocket-Protocol", clientProto)
+						break
+					}
+				}
+				// If we found a match, break
+				if responseHeader.Get("Sec-WebSocket-Protocol") != "" {
+					break
+				}
+			}
+		}
+	}
+	
 	acceptKey := computeAcceptKey(key)
 	headers := w.Header()
 	headers.Set("Upgrade", "websocket")
 	headers.Set("Connection", "Upgrade")
 	headers.Set("Sec-WebSocket-Accept", acceptKey)
+	
+	// Copy any additional headers provided by the application
+	for k, vs := range responseHeader {
+		if k == "Sec-WebSocket-Protocol" {
+			headers.Set(k, vs[0])
+		} else {
+			for _, v := range vs {
+				headers.Add(k, v)
+			}
+		}
+	}
+	
 	w.WriteHeader(http.StatusSwitchingProtocols)
 
 	hj, ok := w.(http.Hijacker)
@@ -117,6 +217,8 @@ type Dialer struct {
 	HandshakeTimeout time.Duration
 	ReadBufferSize   int
 	WriteBufferSize  int
+	// Subprotocols specifies the client's requested subprotocols.
+	Subprotocols []string
 }
 
 var DefaultDialer = &Dialer{
@@ -150,6 +252,12 @@ func (d *Dialer) Dial(rawurl string, requestHeader http.Header) (*Conn, *http.Re
 		"Connection: Upgrade\r\n" +
 		fmt.Sprintf("Sec-WebSocket-Key: %s\r\n", key) +
 		"Sec-WebSocket-Version: 13\r\n"
+		
+	// Add subprotocols if specified
+	if len(d.Subprotocols) > 0 {
+		req += fmt.Sprintf("Sec-WebSocket-Protocol: %s\r\n", strings.Join(d.Subprotocols, ", "))
+	}
+	
 	for k, vals := range requestHeader {
 		for _, v := range vals {
 			req += fmt.Sprintf("%s: %s\r\n", k, v)

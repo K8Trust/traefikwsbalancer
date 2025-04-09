@@ -37,7 +37,6 @@ A high-performance WebSocket connection balancer middleware for Traefik that dis
 
 ### Prerequisites
 - Go 1.22 or higher
-- gorilla/websocket v1.5.3 or higher
 
 ### Installation
 
@@ -208,6 +207,27 @@ The plugin provides a dedicated metrics endpoint that displays:
 }
 ```
 
+## Implementation Details
+
+### WebSocket Implementation
+
+This plugin uses a custom lightweight WebSocket implementation that follows RFC 6455 without external dependencies. The implementation includes:
+
+- Basic WebSocket protocol handshake
+- Support for text and binary messages
+- Control frames (ping/pong, close)
+- WebSocket subprotocol negotiation
+- Connection keep-alive with automated ping/pong
+
+### Advanced WebSocket Features
+
+The implementation supports several advanced WebSocket features:
+
+- Subprotocol negotiation for both client and server connections
+- Binary message transfers
+- Automatic ping/pong exchanges for connection health monitoring
+- Proper connection close sequences
+
 ## Architecture
 
 ### Connection Flow
@@ -353,6 +373,5 @@ For issues and feature requests, please create an issue in the GitHub repository
 
 ## Acknowledgments
 
-- gorilla/websocket team for the excellent WebSocket implementation
 - Traefik team for the plugin system
 - Contributors who have helped improve this project

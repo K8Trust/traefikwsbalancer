@@ -390,8 +390,9 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	log.Printf("[DEBUG] Found pod info, will attempt to discover all pods for service %s", service)
 	allPodMetrics := []dashboard.PodMetrics{initialPodMetrics}
 
-	// Extract service DNS name.
-	serviceBase := strings.TrimPrefix(service, "http://")
+	// Extract service DNS name and pod info.
+	// Unused for now, but kept for future expansion
+	_ = strings.TrimPrefix(service, "http://")
 	podName := initialPodMetrics.PodName
 	parts := strings.Split(podName, "-")
 	if len(parts) < 2 {
@@ -971,10 +972,20 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 		return
 	}
 
+	// Extract client-requested subprotocols
+	clientProtocols := req.Header.Get("Sec-WebSocket-Protocol")
+	var requestedProtocols []string
+	if clientProtocols != "" {
+		requestedProtocols = strings.Split(clientProtocols, ", ")
+		log.Printf("[DEBUG] Client requested WebSocket subprotocols: %v", requestedProtocols)
+	}
+
+	// Setup dialer with the same subprotocols the client requested
 	dialer := ws.Dialer{
 		HandshakeTimeout: b.DialTimeout,
 		ReadBufferSize:   1024,
 		WriteBufferSize:  1024,
+		Subprotocols:     requestedProtocols,
 	}
 
 	targetURL := "ws" + strings.TrimPrefix(targetService, "http") + req.URL.Path
@@ -1049,18 +1060,32 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 	}
 	defer backendConn.Close()
 
+	// Check if backend responded with a subprotocol
+	var negotiatedProtocol string
+	if resp != nil && resp.Header != nil {
+		negotiatedProtocol = resp.Header.Get("Sec-WebSocket-Protocol")
+		if negotiatedProtocol != "" {
+			log.Printf("[DEBUG] Backend negotiated WebSocket subprotocol: %s", negotiatedProtocol)
+		}
+	}
+
 	// Add custom upgrader options compatible with Node.js ws
 	upgrader := ws.Upgrader{
 		HandshakeTimeout: b.DialTimeout,
 		ReadBufferSize:   1024,
 		WriteBufferSize:  1024,
 		CheckOrigin:      func(r *http.Request) bool { return true },
-		Subprotocols:     []string{"permessage-deflate"}, // Add support for compression
+		Subprotocols:     requestedProtocols,
 	}
 
 	// Add CORS headers to the WebSocket upgrade response
 	responseHeader := http.Header{}
 	responseHeader.Set("Access-Control-Allow-Origin", "*")
+	
+	// Pass along the negotiated subprotocol if any
+	if negotiatedProtocol != "" {
+		responseHeader.Set("Sec-WebSocket-Protocol", negotiatedProtocol)
+	}
 
 	clientConn, err := upgrader.Upgrade(rw, req, responseHeader)
 	if err != nil {
@@ -1074,12 +1099,36 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 	clientDone := make(chan struct{})
 	backendDone := make(chan struct{})
 
+	// Set up ping/pong handlers if needed
+	pingInterval := 25 * time.Second
+	pingTimer := time.NewTicker(pingInterval)
+	defer pingTimer.Stop()
+	
 	go func() {
 		defer close(clientDone)
+		defer pingTimer.Stop()
+		
 		for {
 			messageType, message, err := clientConn.ReadMessage()
 			if err != nil {
 				log.Printf("[DEBUG] Error reading from client: %v", err)
+				return
+			}
+			
+			switch messageType {
+			case ws.PingMessage:
+				// Respond with pong
+				if err := clientConn.WriteControl(ws.PongMessage, message, time.Now().Add(10*time.Second)); err != nil {
+					log.Printf("[DEBUG] Failed to send pong to client: %v", err)
+					return
+				}
+				continue
+			case ws.PongMessage:
+				// Received pong, nothing to do
+				continue
+			case ws.CloseMessage:
+				// Client initiated close
+				log.Printf("[DEBUG] Client initiated WebSocket close")
 				return
 			}
 			
@@ -1095,10 +1144,28 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 
 	go func() {
 		defer close(backendDone)
+		
 		for {
 			messageType, message, err := backendConn.ReadMessage()
 			if err != nil {
 				log.Printf("[DEBUG] Error reading from backend: %v", err)
+				return
+			}
+			
+			switch messageType {
+			case ws.PingMessage:
+				// Respond with pong
+				if err := backendConn.WriteControl(ws.PongMessage, message, time.Now().Add(10*time.Second)); err != nil {
+					log.Printf("[DEBUG] Failed to send pong to backend: %v", err)
+					return
+				}
+				continue
+			case ws.PongMessage:
+				// Received pong, nothing to do
+				continue
+			case ws.CloseMessage:
+				// Backend initiated close
+				log.Printf("[DEBUG] Backend initiated WebSocket close")
 				return
 			}
 			
@@ -1107,6 +1174,30 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 			err = clientConn.WriteMessage(messageType, message)
 			if err != nil {
 				log.Printf("[DEBUG] Error writing to client: %v", err)
+				return
+			}
+		}
+	}()
+	
+	// Send periodic pings to keep connection alive
+	go func() {
+		for {
+			select {
+			case <-pingTimer.C:
+				// Send ping to client
+				if err := clientConn.WriteControl(ws.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+					log.Printf("[DEBUG] Failed to send ping to client: %v", err)
+					return
+				}
+				
+				// Send ping to backend
+				if err := backendConn.WriteControl(ws.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+					log.Printf("[DEBUG] Failed to send ping to backend: %v", err)
+					return
+				}
+			case <-clientDone:
+				return
+			case <-backendDone:
 				return
 			}
 		}

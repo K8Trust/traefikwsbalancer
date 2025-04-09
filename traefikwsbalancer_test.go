@@ -11,6 +11,7 @@ import (
 
 	"github.com/K8Trust/traefikwsbalancer"
 	"github.com/K8Trust/traefikwsbalancer/ws"
+	"github.com/K8Trust/traefikwsbalancer/internal/dashboard"
 )
 
 // MockFetcher is a mock implementation of ConnectionFetcher for testing.
@@ -76,7 +77,7 @@ func TestGetConnections(t *testing.T) {
 					"podIP": "10.0.0.1",
 					"nodeName": "test-node-1",
 					"totalConnectionsReceived": 10,
-					"activeConnections": []string{"agent1", "agent2"}
+					"activeConnections": []string{"agent1", "agent2"},
 				}
 				
 				json.NewEncoder(w).Encode(response)
@@ -142,10 +143,13 @@ func TestWebSocketConnection(t *testing.T) {
 			MockURL:     backendServer.URL,
 			Connections: 1,
 		},
-		Services:     []string{backendServer.URL},
-		DialTimeout:  2 * time.Second,
-		WriteTimeout: 2 * time.Second,
-		ReadTimeout:  2 * time.Second,
+		Services:         []string{backendServer.URL},
+		DialTimeout:      2 * time.Second,
+		WriteTimeout:     2 * time.Second,
+		ReadTimeout:      2 * time.Second,
+		ConnectionCount:  make(map[string]int),
+		LastRefresh:      make(map[string]time.Time),
+		Metrics:          make(map[string]map[string]dashboard.PodMetrics),
 	}
 
 	// Initialize the connection cache for testing
