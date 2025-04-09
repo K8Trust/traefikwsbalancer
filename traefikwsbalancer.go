@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -160,6 +161,14 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	// Start background refresh routines
 	go b.Refresh()
 	
+	// Run initial diagnostics for each service
+	for _, service := range config.Services {
+		go func(svc string) {
+			log.Printf("[INFO] Running initial diagnostics for service: %s", svc)
+			b.runDetailedDiagnostics(svc)
+		}(service)
+	}
+	
 	return b, nil
 }
 
@@ -233,136 +242,187 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	// Step 1: First try using the endpoints API which is already implemented in your backend
 	log.Printf("[DEBUG] Attempting to use endpoints API for service %s", service)
 	endpointsURL := fmt.Sprintf("%s/endpoints", service)
+	log.Printf("[DEBUG] Endpoints URL: %s", endpointsURL)
+	
 	endpointsReq, err := http.NewRequest("GET", endpointsURL, nil)
-	if err == nil {
+	if err != nil {
+		log.Printf("[ERROR] Failed to create endpoints request: %v", err)
+		// Continue to next approach instead of returning
+	} else {
 		endpointsReq.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
 		endpointsReq.Header.Set("Accept", "application/json")
 		
+		log.Printf("[DEBUG] Sending endpoints API request to %s", endpointsURL)
 		endpointsResp, err := b.Client.Do(endpointsReq)
-		if err == nil && endpointsResp.StatusCode == http.StatusOK {
-			defer endpointsResp.Body.Close()
-			log.Printf("[DEBUG] Endpoints API response: status=%d", endpointsResp.StatusCode)
-			
-			endpointsBody, err := io.ReadAll(endpointsResp.Body)
-			if err == nil {
-				log.Printf("[DEBUG] Endpoints API response body: %s", string(endpointsBody))
+		if err != nil {
+			log.Printf("[ERROR] Failed to query endpoints API for service %s: %v", service, err)
+		} else {
+			statusCode := endpointsResp.StatusCode
+			if statusCode == http.StatusOK {
+				endpointsBody, err := io.ReadAll(endpointsResp.Body)
+				endpointsResp.Body.Close()
 				
-				// Try to parse as array of endpoints first
-				var endpointsArray []struct {
-					Pod struct {
-						Name string `json:"name"`
-						IP   string `json:"ip"`
-						Node string `json:"node"`
-					} `json:"pod"`
-					Connections int `json:"connections"`
-				}
-				
-				if json.Unmarshal(endpointsBody, &endpointsArray) == nil && len(endpointsArray) > 0 {
-					log.Printf("[DEBUG] Successfully parsed endpoints as array with %d items", len(endpointsArray))
-					var allPodMetrics []dashboard.PodMetrics
-					for _, endpoint := range endpointsArray {
-						podMetrics := dashboard.PodMetrics{
-							PodName:           endpoint.Pod.Name,
-							PodIP:             endpoint.Pod.IP,
-							NodeName:          endpoint.Pod.Node,
-							AgentsConnections: endpoint.Connections,
-						}
-						allPodMetrics = append(allPodMetrics, podMetrics)
-					}
-					return allPodMetrics, nil
-				}
-				
-				// Fall back to single endpoint object if array parsing fails
-				var endpointsData struct {
-					Pod struct {
-						Name string `json:"name"`
-						IP   string `json:"ip"`
-						Node string `json:"node"`
-					} `json:"pod"`
-					Connections int `json:"connections"`
-				}
-				
-				if json.Unmarshal(endpointsBody, &endpointsData) == nil {
-					podMetrics := dashboard.PodMetrics{
-						PodName:           endpointsData.Pod.Name,
-						PodIP:             endpointsData.Pod.IP,
-						NodeName:          endpointsData.Pod.Node,
-						AgentsConnections: endpointsData.Connections,
+				if err == nil && len(endpointsBody) > 0 {
+					// Try to parse the response as an array of endpoints
+					var podMetricsArray []dashboard.PodMetrics
+					arrayErr := json.Unmarshal(endpointsBody, &podMetricsArray)
+					if arrayErr == nil && len(podMetricsArray) > 0 {
+						log.Printf("[DEBUG] Parsed endpoints as array with %d items", len(podMetricsArray))
+						return podMetricsArray, nil
+					} else {
+						log.Printf("[DEBUG] Failed to parse endpoints as array: %v", arrayErr)
 					}
 					
-					log.Printf("[DEBUG] Created pod metrics from endpoints API: %+v", podMetrics)
-					return []dashboard.PodMetrics{podMetrics}, nil
+					// Try to parse the response as a single endpoint object
+					var endpointsData struct {
+						Pod struct {
+							Name string `json:"name"`
+							IP   string `json:"ip"`
+							Node string `json:"node"`
+						} `json:"pod"`
+						Connections int `json:"connections"`
+					}
+					
+					singleErr := json.Unmarshal(endpointsBody, &endpointsData)
+					if singleErr == nil && endpointsData.Pod.Name != "" {
+						podMetrics := dashboard.PodMetrics{
+							PodName:           endpointsData.Pod.Name,
+							PodIP:             endpointsData.Pod.IP,
+							NodeName:          endpointsData.Pod.Node,
+							AgentsConnections: endpointsData.Connections,
+						}
+						
+						log.Printf("[DEBUG] Created pod metrics from endpoints API: %+v", podMetrics)
+						return []dashboard.PodMetrics{podMetrics}, nil
+					} else {
+						log.Printf("[DEBUG] Failed to parse endpoints as single object: %v", singleErr)
+					}
+					
+					// Try parsing the raw JSON to see what fields are present
+					var rawJSON map[string]interface{}
+					if err := json.Unmarshal(endpointsBody, &rawJSON); err == nil {
+						log.Printf("[DEBUG] Raw JSON fields: %v", rawJSON)
+					}
 				}
+			} else {
+				// Try to read error message from non-OK responses
+				defer endpointsResp.Body.Close()
+				errorBody, _ := io.ReadAll(endpointsResp.Body)
+				log.Printf("[ERROR] Endpoints API error response (%d): %s", statusCode, string(errorBody))
 			}
-		} else if endpointsResp != nil {
-			endpointsResp.Body.Close()
 		}
 	}
 
 	// Try getting all pods endpoint if available
 	log.Printf("[DEBUG] Attempting to use all-pods API for service %s", service)
 	allPodsURL := fmt.Sprintf("%s/pods", service)
+	log.Printf("[DEBUG] All-pods URL: %s", allPodsURL)
+	
 	allPodsReq, err := http.NewRequest("GET", allPodsURL, nil)
-	if err == nil {
+	if err != nil {
+		log.Printf("[ERROR] Failed to create all-pods request: %v", err)
+		// Continue to next approach
+	} else {
 		allPodsReq.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
 		allPodsReq.Header.Set("Accept", "application/json")
 		
+		log.Printf("[DEBUG] Sending all-pods API request to %s", allPodsURL)
 		allPodsResp, err := b.Client.Do(allPodsReq)
-		if err == nil && allPodsResp.StatusCode == http.StatusOK {
-			defer allPodsResp.Body.Close()
-			log.Printf("[DEBUG] All-pods API response: status=%d", allPodsResp.StatusCode)
-			
-			allPodsBody, err := io.ReadAll(allPodsResp.Body)
-			if err == nil {
-				log.Printf("[DEBUG] All-pods API response body: %s", string(allPodsBody))
+		if err != nil {
+			log.Printf("[ERROR] Failed to query all-pods API for service %s: %v", service, err)
+		} else {
+			statusCode := allPodsResp.StatusCode
+			if statusCode == http.StatusOK {
+				allPodsBody, err := io.ReadAll(allPodsResp.Body)
+				allPodsResp.Body.Close()
 				
-				var podsArray []dashboard.PodMetrics
-				if json.Unmarshal(allPodsBody, &podsArray) == nil && len(podsArray) > 0 {
-					log.Printf("[DEBUG] Successfully parsed all-pods as array with %d items", len(podsArray))
-					return podsArray, nil
+				if err == nil && len(allPodsBody) > 0 {
+					bodyStr := string(allPodsBody)
+					log.Printf("[DEBUG] All-pods API response body (%d bytes): %s", len(bodyStr), bodyStr)
+					
+					var podsArray []dashboard.PodMetrics
+					arrayErr := json.Unmarshal(allPodsBody, &podsArray)
+					if arrayErr == nil && len(podsArray) > 0 {
+						log.Printf("[DEBUG] Successfully parsed all-pods as array with %d items", len(podsArray))
+						return podsArray, nil
+					} else {
+						log.Printf("[DEBUG] Failed to parse all-pods as array: %v", arrayErr)
+						
+						// Try parsing as a single pod object
+						var singlePod dashboard.PodMetrics
+						singleErr := json.Unmarshal(allPodsBody, &singlePod)
+						if singleErr == nil && singlePod.PodName != "" {
+							log.Printf("[DEBUG] Successfully parsed all-pods as single pod: %+v", singlePod)
+							return []dashboard.PodMetrics{singlePod}, nil
+						} else {
+							log.Printf("[DEBUG] Failed to parse all-pods as single pod: %v", singleErr)
+						}
+						
+						// Try parsing the raw JSON to see what fields are present
+						var rawJSON map[string]interface{}
+						if err := json.Unmarshal(allPodsBody, &rawJSON); err == nil {
+							log.Printf("[DEBUG] Raw JSON fields: %v", rawJSON)
+						}
+					}
 				}
+			} else {
+				// Try to read error message from non-OK responses
+				defer allPodsResp.Body.Close()
+				errorBody, _ := io.ReadAll(allPodsResp.Body)
+				log.Printf("[ERROR] All-pods API error response (%d): %s", statusCode, string(errorBody))
 			}
-		} else if allPodsResp != nil {
-			allPodsResp.Body.Close()
 		}
+	}
+
+	// Try to discover pods via DNS before querying the service endpoint
+	dnsDiscoveredPods, found := b.discoverPodViaDNS(service)
+	if found {
+		log.Printf("[INFO] Successfully discovered pods via DNS for service %s", service)
+		return dnsDiscoveredPods, nil
 	}
 
 	// Step 2: Fall back to querying the service for initial pod metrics.
 	log.Printf("[DEBUG] Fetching connections from service %s using metric path %s", service, b.MetricPath)
-	metricReq, err := http.NewRequest("GET", service+b.MetricPath, nil)
+	metricURL := service + b.MetricPath
+	log.Printf("[DEBUG] Metric URL: %s", metricURL)
+	
+	metricReq, err := http.NewRequest("GET", metricURL, nil)
 	if err != nil {
-		log.Printf("[ERROR] Failed to create request for %s: %v", service+b.MetricPath, err)
+		log.Printf("[ERROR] Failed to create request for %s: %v", metricURL, err)
 		return nil, err
 	}
 	
 	metricReq.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
 	metricReq.Header.Set("Accept", "application/json")
 	
-	resp, err := b.Client.Do(metricReq)
+	log.Printf("[DEBUG] Sending metric request to %s", metricURL)
+	metricResp, err := b.Client.Do(metricReq)
 	if err != nil {
 		log.Printf("[ERROR] Failed to fetch connections from service %s: %v", service, err)
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer metricResp.Body.Close()
 	
-	log.Printf("[DEBUG] Metric endpoint response: status=%d", resp.StatusCode)
+	log.Printf("[DEBUG] Received response from %s: status=%d", metricURL, metricResp.StatusCode)
 	
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[ERROR] Non-OK status code from %s: %d", service+b.MetricPath, resp.StatusCode)
-		return nil, fmt.Errorf("service returned status %d", resp.StatusCode)
+	if metricResp.StatusCode != http.StatusOK {
+		log.Printf("[ERROR] Non-OK status code from %s: %d", metricURL, metricResp.StatusCode)
+		return nil, fmt.Errorf("service returned status %d", metricResp.StatusCode)
 	}
-
-	body, err := io.ReadAll(resp.Body)
+	
+	body, err := io.ReadAll(metricResp.Body)
 	if err != nil {
 		log.Printf("[ERROR] Failed to read response body from service %s: %v", service, err)
 		return nil, err
 	}
 	
-	log.Printf("[DEBUG] Metric endpoint response body: %s", string(body))
-
+	log.Printf("[DEBUG] Response body from %s (%d bytes): %s", metricURL, len(body), string(body))
+	
 	var initialPodMetrics dashboard.PodMetrics
-	if err := json.Unmarshal(body, &initialPodMetrics); err != nil {
-		log.Printf("[DEBUG] Failed to decode as pod metrics, trying legacy format: %v", err)
+	podErr := json.Unmarshal(body, &initialPodMetrics)
+	
+	if podErr != nil {
+		log.Printf("[DEBUG] Failed to decode as pod metrics (%v), trying legacy format", podErr)
 		var legacyMetrics struct {
 			AgentsConnections    int      `json:"agentsConnections"`
 			PodName              string   `json:"podName"`
@@ -371,9 +431,42 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 			TotalConnections     int      `json:"totalConnectionsReceived"`
 			ActiveConnections    []string `json:"activeConnections"`
 		}
-		if err := json.Unmarshal(body, &legacyMetrics); err != nil {
-			log.Printf("[ERROR] Failed to decode metrics from service %s: %v", service, err)
-			return nil, err
+		legacyErr := json.Unmarshal(body, &legacyMetrics)
+		if legacyErr != nil {
+			log.Printf("[ERROR] Failed to decode metrics from service %s: %v", service, legacyErr)
+			
+			// Try parsing the raw JSON to see what fields are present
+			var rawJSON map[string]interface{}
+			if err := json.Unmarshal(body, &rawJSON); err == nil {
+				log.Printf("[DEBUG] Raw JSON metric fields: %v", rawJSON)
+				
+				// Extract what we can from the raw JSON
+				if agentConns, ok := rawJSON["agentsConnections"].(float64); ok {
+					initialPodMetrics.AgentsConnections = int(agentConns)
+				}
+				if podName, ok := rawJSON["podName"].(string); ok {
+					initialPodMetrics.PodName = podName
+				}
+				if podIP, ok := rawJSON["podIP"].(string); ok {
+					initialPodMetrics.PodIP = podIP
+				}
+				if nodeName, ok := rawJSON["nodeName"].(string); ok {
+					initialPodMetrics.NodeName = nodeName
+				}
+				
+				log.Printf("[DEBUG] Extracted pod metrics from raw JSON: %+v", initialPodMetrics)
+				return []dashboard.PodMetrics{initialPodMetrics}, nil
+			}
+			
+			// Create a fallback dummy pod for service continuity
+			dummyPod := dashboard.PodMetrics{
+				PodName:           "parse-error-pod",
+				PodIP:             "0.0.0.0",
+				NodeName:          "parse-error-node",
+				AgentsConnections: 0,
+			}
+			log.Printf("[WARN] Returning fallback dummy pod for parse error: %+v", dummyPod)
+			return []dashboard.PodMetrics{dummyPod}, nil
 		}
 		
 		// Use the expanded format from your Node.js server
@@ -384,58 +477,194 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 			NodeName:          legacyMetrics.NodeName,
 		}
 		
-		log.Printf("[DEBUG] Parsed pod metrics: %+v", initialPodMetrics)
+		log.Printf("[DEBUG] Parsed pod metrics from legacy format: %+v", initialPodMetrics)
+	} else {
+		log.Printf("[DEBUG] Parsed pod metrics from standard format: %+v", initialPodMetrics)
 	}
 
 	// If no pod info is available, return the single metric.
 	if initialPodMetrics.PodName == "" || initialPodMetrics.PodIP == "" {
-		log.Printf("[WARN] Pod name or IP missing from metrics response")
-		return []dashboard.PodMetrics{initialPodMetrics}, nil
+		log.Printf("[WARN] Pod name or IP missing from metrics response, using placeholder values")
+		initialPodMetrics.PodName = initialPodMetrics.PodName
+		if initialPodMetrics.PodName == "" {
+			initialPodMetrics.PodName = "unnamed-pod"
+		}
+		initialPodMetrics.PodIP = initialPodMetrics.PodIP
+		if initialPodMetrics.PodIP == "" {
+			initialPodMetrics.PodIP = "0.0.0.0"
+		}
+		initialPodMetrics.NodeName = initialPodMetrics.NodeName
+		if initialPodMetrics.NodeName == "" {
+			initialPodMetrics.NodeName = "unnamed-node"
+		}
 	}
 
 	log.Printf("[DEBUG] Found pod info, will attempt to discover all pods for service %s", service)
 	allPodMetrics := []dashboard.PodMetrics{initialPodMetrics}
 
-	// Extract service DNS name and pod info.
-	// Unused for now, but kept for future expansion
-	_ = strings.TrimPrefix(service, "http://")
-	podName := initialPodMetrics.PodName
-	parts := strings.Split(podName, "-")
-	if len(parts) < 2 {
-		log.Printf("[INFO] Pod name format not suitable for discovery: %s", podName)
-		return allPodMetrics, nil
-	}
-	
-	// This handles pod names like kbrain-socket-agent-6649594bd-8fhj7
-	// We try to extract the deployment name
-	var baseName string
-	if len(parts) >= 3 {
-		// For deployment pods, we try to get the base deployment name
-		// e.g., "kbrain-socket-agent" from "kbrain-socket-agent-6649594bd-8fhj7"
-		if len(parts[len(parts)-1]) == 5 && len(parts[len(parts)-2]) >= 8 {
-			// Looks like a ReplicaSet suffix with random chars
-			baseName = strings.Join(parts[:len(parts)-2], "-")
-			log.Printf("[DEBUG] Extracted deployment name: %s from pod name: %s", baseName, podName)
-		} else {
-			baseName = strings.Join(parts[:len(parts)-1], "-")
-		}
-	} else {
-		baseNameParts := parts[:len(parts)-1]
-		baseName = strings.Join(baseNameParts, "-")
-	}
-	
-	log.Printf("[DEBUG] Using base name %s for pod discovery", baseName)
-	
-	// Create a dedicated discovery client with a shorter timeout.
-	discoveryClient := &http.Client{Timeout: b.DiscoveryTimeout}
-
-	// Enhanced IP scanning
-	if initialPodMetrics.PodIP != "" && b.EnableIPScanning {
-		log.Printf("[DEBUG] Starting enhanced IP scanning with pod IP: %s", initialPodMetrics.PodIP)
-		b.scanAdjacentIPs(discoveryClient, initialPodMetrics, &allPodMetrics)
-	}
-
 	return allPodMetrics, nil
+}
+
+// discoverPodViaDNS attempts to discover pod metrics by querying individual pod DNS names
+// when K8s has dynamic DNS entries for pods
+func (b *Balancer) discoverPodViaDNS(service string) ([]dashboard.PodMetrics, bool) {
+	serviceURL, err := url.Parse(service)
+	if err != nil {
+		log.Printf("[ERROR] Failed to parse service URL: %v", err)
+		return nil, false
+	}
+	
+	// Extract the service hostname
+	hostname := serviceURL.Hostname()
+	if hostname == "" {
+		log.Printf("[ERROR] Service hostname is empty")
+		return nil, false
+	}
+	
+	// Extract namespace and service name from hostname
+	// Format is typically: service-name.namespace.svc.cluster.local
+	parts := strings.Split(hostname, ".")
+	if len(parts) < 2 {
+		log.Printf("[ERROR] Cannot parse service hostname parts: %s", hostname)
+		return nil, false
+	}
+	
+	serviceName := parts[0]
+	namespace := parts[1]
+	
+	// Try to find pods in the format: pod-name.service-name.namespace.svc.cluster.local
+	// First, get the pod deployment prefix by trying to resolve the service
+	// This is typically done with a headless service in K8s
+	ips, err := net.LookupIP(hostname)
+	if err != nil {
+		log.Printf("[ERROR] Failed to resolve service hostname %s: %v", hostname, err)
+		// Continue anyway, we'll try a different approach
+	} else {
+		log.Printf("[DEBUG] Service %s resolves to IPs: %v", hostname, ips)
+	}
+	
+	// Try to discover pods via DNS from log patterns
+	// In logs we see patterns like:
+	// kbrain-socket-agent-65fdc7655f-aaauo.kbrain-socket-agent-ktrust-service.phaedra.svc.cluster.local
+	
+	// Extract unique pod identifier patterns from the hostname
+	// Example: Convert "kbrain-socket-agent-ktrust-service" to find "kbrain-socket-agent-"
+	prefixParts := strings.Split(serviceName, "-")
+	if len(prefixParts) < 2 {
+		log.Printf("[WARN] Service name '%s' doesn't follow expected pattern for DNS discovery", serviceName)
+		return nil, false
+	}
+	
+	// Take the first two parts as deployment prefix to search for
+	deployPrefix := strings.Join(prefixParts[:2], "-") + "-"
+	log.Printf("[DEBUG] Using deployment prefix '%s' for DNS discovery", deployPrefix)
+	
+	// Try multiple pod suffixes to discover active pods
+	// In Kubernetes deployments, pods often have names like deployment-replicaset-podid
+	// Common pod ID patterns from logs
+	podSuffixes := []string{"aaauo", "aaakz", "aab22", "aaaaa", "aaaab", "aaaac", "aaaad"}
+	
+	var discoveredPods []dashboard.PodMetrics
+	
+	// Try to discover using the ReplicaSet pattern from logs
+	// Find patterns like kbrain-socket-agent-65fdc7655f-aaauo
+	for _, suffix := range podSuffixes {
+		// Try to discover pods using the pattern from the logs
+		// Format: deployPrefix-replicasetHash-podSuffix.serviceName.namespace
+		
+		// Look for a common replicaset hash pattern like 65fdc7655f
+		// Try a few common patterns if we don't know the exact one
+		replicaSetHashes := []string{"65fdc7655f", "deployment", "statefulset", ""}
+		
+		for _, hash := range replicaSetHashes {
+			var podName string
+			if hash == "" {
+				// Try without replicaset hash
+				podName = deployPrefix + suffix
+			} else {
+				podName = deployPrefix + hash + "-" + suffix
+			}
+			
+			// Create full DNS name
+			podDNS := fmt.Sprintf("%s.%s.%s.svc.cluster.local", podName, serviceName, namespace)
+			log.Printf("[DEBUG] Trying to discover pod via DNS: %s%s", podDNS, b.MetricPath)
+			
+			// Try to query the pod directly
+			podURL := fmt.Sprintf("http://%s%s", podDNS, b.MetricPath)
+			req, err := http.NewRequest("GET", podURL, nil)
+			if err != nil {
+				continue
+			}
+			
+			req.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			req = req.WithContext(ctx)
+			
+			resp, err := b.Client.Do(req)
+			cancel()
+			
+			if err != nil {
+				continue
+			}
+			
+			if resp.StatusCode == http.StatusOK {
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				
+				if err != nil {
+					continue
+				}
+				
+				var podMetrics dashboard.PodMetrics
+				err = json.Unmarshal(body, &podMetrics)
+				if err != nil {
+					// Try legacy format
+					var legacyMetrics struct {
+						AgentsConnections int    `json:"agentsConnections"`
+						PodName           string `json:"podName"`
+						PodIP             string `json:"podIP"`
+						NodeName          string `json:"nodeName"`
+					}
+					
+					err = json.Unmarshal(body, &legacyMetrics)
+					if err != nil {
+						continue
+					}
+					
+					podMetrics = dashboard.PodMetrics{
+						AgentsConnections: legacyMetrics.AgentsConnections,
+						PodName:           legacyMetrics.PodName,
+						PodIP:             legacyMetrics.PodIP,
+						NodeName:          legacyMetrics.NodeName,
+					}
+				}
+				
+				// If pod didn't return its name, use the DNS name
+				if podMetrics.PodName == "" {
+					podMetrics.PodName = podName
+				}
+				
+				// If pod didn't return IP, try to resolve it
+				if podMetrics.PodIP == "" {
+					ips, err := net.LookupIP(podDNS)
+					if err == nil && len(ips) > 0 {
+						podMetrics.PodIP = ips[0].String()
+					}
+				}
+				
+				log.Printf("[INFO] Successfully discovered pod %s via DNS with %d connections", 
+					podMetrics.PodName, podMetrics.AgentsConnections)
+				discoveredPods = append(discoveredPods, podMetrics)
+			}
+		}
+	}
+	
+	if len(discoveredPods) > 0 {
+		log.Printf("[INFO] Discovered %d pods via DNS for service %s", len(discoveredPods), serviceName)
+		return discoveredPods, true
+	}
+	
+	return nil, false
 }
 
 // scanAdjacentIPs tries to discover pods by scanning IP addresses near the known pod
@@ -614,10 +843,68 @@ func (b *Balancer) StartBackgroundRefresh() {
 
 // refreshServiceConnectionCount queries the backend service for the current connection count.
 func (b *Balancer) refreshServiceConnectionCount(service string) (int, error) {
+	// Add panic recovery to prevent the balancer from crashing
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] Recovered from panic in refreshServiceConnectionCount for %s: %v", service, r)
+		}
+	}()
+
+	log.Printf("[DEBUG] Refreshing connection count for service: %s", service)
+	
 	podMetrics, err := b.GetAllPodsForService(service)
 	if err != nil {
 		log.Printf("[ERROR] Failed to get pod metrics for service %s: %v", service, err)
+		// Don't return here - instead use any cached data if available
+		b.MetricsMutex.RLock()
+		metrics, exists := b.Metrics[service]
+		b.MetricsMutex.RUnlock()
+		
+		if exists && len(metrics) > 0 {
+			log.Printf("[INFO] Using cached metrics for service %s due to error", service)
+			// Keep using the cached values
+			b.CountMutex.RLock()
+			count := b.ConnectionCount[service]
+			b.CountMutex.RUnlock()
+			return count, err
+		}
+		
+		// If no cached data, initialize with zero to prevent "no cached count" errors
+		log.Printf("[WARN] No cached metrics available for service %s, initializing with zero", service)
+		
+		// Update cache to avoid "no cached count" errors
+		b.CountMutex.Lock()
+		b.ConnectionCount[service] = 0
+		b.LastRefresh[service] = time.Now()
+		b.CountMutex.Unlock()
+		
+		// Also initialize an empty metrics map to keep things consistent
+		b.MetricsMutex.Lock()
+		if _, exists := b.Metrics[service]; !exists {
+			b.Metrics[service] = make(map[string]dashboard.PodMetrics)
+			// Add a placeholder pod for UI representation
+			b.Metrics[service]["placeholder"] = dashboard.PodMetrics{
+				PodName:           "no-data-available",
+				PodIP:             "0.0.0.0",
+				NodeName:          "unknown-node",
+				AgentsConnections: 0,
+			}
+		}
+		b.MetricsMutex.Unlock()
+		
 		return 0, err
+	}
+
+	if len(podMetrics) == 0 {
+		log.Printf("[WARN] No pod metrics found for service %s", service)
+		podMetrics = []dashboard.PodMetrics{
+			{
+				PodName:           "no-pods-found",
+				PodIP:             "0.0.0.0",
+				NodeName:          "unknown-node",
+				AgentsConnections: 0,
+			},
+		}
 	}
 
 	// Store pod metrics in the dashboard
@@ -626,11 +913,20 @@ func (b *Balancer) refreshServiceConnectionCount(service string) (int, error) {
 	if !exists {
 		metrics = make(map[string]dashboard.PodMetrics)
 		b.Metrics[service] = metrics
+	} else {
+		// Clear existing metrics to avoid stale data
+		for k := range metrics {
+			delete(metrics, k)
+		}
 	}
 
 	var totalConnections int
 	log.Printf("[DEBUG] Found %d pods for service %s", len(podMetrics), service)
 	for _, podMetric := range podMetrics {
+		if podMetric.PodName == "" {
+			log.Printf("[WARN] Skipping pod with empty name for service %s", service)
+			continue
+		}
 		metrics[podMetric.PodName] = podMetric
 		totalConnections += podMetric.AgentsConnections
 		log.Printf("[DEBUG] Pod %s has %d connections", podMetric.PodName, podMetric.AgentsConnections)
@@ -643,6 +939,8 @@ func (b *Balancer) refreshServiceConnectionCount(service string) (int, error) {
 	b.LastRefresh[service] = time.Now() // Keep using UTC internally
 	b.CountMutex.Unlock()
 
+	log.Printf("[INFO] Updated connection count for service %s: %d connections across %d pods", 
+		service, totalConnections, len(podMetrics))
 	return totalConnections, nil
 }
 
@@ -650,14 +948,20 @@ func (b *Balancer) refreshServiceConnectionCount(service string) (int, error) {
 func (b *Balancer) Refresh() {
 	ticker := time.NewTicker(time.Duration(b.RefreshInterval) * time.Second)
 	forcedFullRefresh := time.NewTicker(30 * time.Second) // Force a full refresh every 30 seconds
+	forcedConnectionCheck := time.NewTicker(10 * time.Second) // Force a connection check every 10 seconds
 	defer ticker.Stop()
 	defer forcedFullRefresh.Stop()
+	defer forcedConnectionCheck.Stop()
 
 	// Immediately populate initial data for all services
 	log.Printf("[INFO] Initial population of connection counts for all services")
 	for _, service := range b.Services {
 		b.refreshServiceConnectionCount(service)
 	}
+	
+	// Keep track of consecutive failures
+	failureCounts := make(map[string]int)
+	maxConsecutiveFailures := 5
 
 	for {
 		select {
@@ -673,6 +977,17 @@ func (b *Balancer) Refresh() {
 						_, err := b.refreshServiceConnectionCount(s)
 						if err != nil {
 							log.Printf("[ERROR] Failed to refresh connection count for service %s: %v", s, err)
+							failureCounts[s]++
+							
+							if failureCounts[s] >= maxConsecutiveFailures {
+								log.Printf("[WARN] Service %s has failed %d consecutive times - running diagnostics", 
+									s, failureCounts[s])
+								go b.runDetailedDiagnostics(s)
+								failureCounts[s] = 0 // Reset after diagnostics
+							}
+						} else {
+							// Reset failure count on success
+							failureCounts[s] = 0
 						}
 					}(service)
 				}
@@ -684,6 +999,40 @@ func (b *Balancer) Refresh() {
 					_, err := b.refreshServiceConnectionCount(s)
 					if err != nil {
 						log.Printf("[ERROR] Failed to refresh connection count for service %s: %v", s, err)
+					}
+				}(service)
+			}
+		case <-forcedConnectionCheck.C:
+			// Perform a basic connectivity check
+			log.Printf("[DEBUG] Performing connectivity check on all services")
+			for _, service := range b.Services {
+				go func(s string) {
+					// Create a simple HEAD request to verify connectivity
+					req, err := http.NewRequest("HEAD", s, nil)
+					if err != nil {
+						log.Printf("[ERROR] Failed to create connectivity check request for %s: %v", s, err)
+						return
+					}
+					
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+					req = req.WithContext(ctx)
+					
+					resp, err := b.Client.Do(req)
+					if err != nil {
+						log.Printf("[ERROR] Connectivity check failed for %s: %v", s, err)
+						failureCounts[s]++
+						
+						if failureCounts[s] >= maxConsecutiveFailures {
+							log.Printf("[WARN] Service %s has failed %d connectivity checks - running diagnostics", 
+								s, failureCounts[s])
+							go b.runDetailedDiagnostics(s)
+							failureCounts[s] = 0 // Reset after diagnostics
+						}
+					} else {
+						resp.Body.Close()
+						log.Printf("[DEBUG] Connectivity check succeeded for %s: status %d", s, resp.StatusCode)
+						failureCounts[s] = 0 // Reset on success
 					}
 				}(service)
 			}
@@ -824,13 +1173,32 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	if selectedService == "" {
-		log.Printf("[WARN] No available services with cached metrics, selecting first service as fallback")
+		log.Printf("[ERROR] No service available for handling request to %s", req.URL.Path)
+		
+		// Force initialization of the first service to avoid future "no cached count" errors
 		if len(b.Services) > 0 {
-			selectedService = b.Services[0]
-			// Force immediate refresh for next request
-			go b.refreshServiceConnectionCount(selectedService)
-		} else {
-			http.Error(rw, "No available service", http.StatusServiceUnavailable)
+			log.Printf("[WARN] Force initializing cache for first service due to service selection failure")
+			firstService := b.Services[0]
+			
+			// Ensure the ConnectionCount is initialized for this service
+			b.CountMutex.Lock()
+			b.ConnectionCount[firstService] = 0
+			b.LastRefresh[firstService] = time.Now()
+			b.CountMutex.Unlock()
+			
+			// Run detailed diagnostics to help troubleshoot
+			go b.runDetailedDiagnostics(firstService)
+			
+			// Use the first service as a fallback
+			selectedService = firstService
+			log.Printf("[INFO] Using first service %s as fallback", selectedService)
+		}
+		
+		// If we still don't have a service to use, return error
+		if selectedService == "" {
+			// Add CORS headers to the error response
+			rw.Header().Set("Access-Control-Allow-Origin", "*")
+			http.Error(rw, "No available backend services", http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -841,21 +1209,16 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.URL.Path,
 		allServiceConnections)
 
-	if ws.IsWebSocketUpgrade(req) {
-		log.Printf("[DEBUG] Handling WebSocket upgrade request")
+	// Handle WebSocket upgrade requests
+	if isWebSocketRequest(req) {
+		log.Printf("[DEBUG] Handling WebSocket request to %s", req.URL.Path)
 		b.handleWebSocket(rw, req, selectedService)
 		return
 	}
 
+	// Handle regular HTTP requests
+	log.Printf("[DEBUG] Handling HTTP request to %s", req.URL.Path)
 	b.handleHTTP(rw, req, selectedService)
-
-	// In ServeHTTP or other methods
-	if time.Since(b.lastDeployTime) < 10*time.Second {
-		// We're in startup mode - be more aggressive about refreshing
-		for _, service := range b.Services {
-			go b.refreshServiceConnectionCount(service)
-		}
-	}
 }
 
 // handleMetricRequest responds with current connection metrics in JSON.
@@ -1055,7 +1418,11 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 	// Attempt to establish WebSocket connection to backend
 	backendConn, resp, err := dialer.Dial(targetURL, cleanHeaders)
 	if err != nil {
-		log.Printf("[ERROR] Failed to connect to backend WebSocket: %v", err)
+		log.Printf("[ERROR] Failed to connect to backend WebSocket at %s: %v", targetURL, err)
+		
+		// Run detailed diagnostics on this service
+		go b.runDetailedDiagnostics(targetService)
+		
 		if resp != nil {
 			log.Printf("[ERROR] Backend response status: %d", resp.StatusCode)
 			log.Printf("[ERROR] Backend response headers: %v", resp.Header)
@@ -1071,8 +1438,20 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 			rw.WriteHeader(resp.StatusCode)
 			rw.Write(body)
 		} else {
+			// Try direct HTTP request to the service to diagnose issues
+			healthCheckURL := "http" + strings.TrimPrefix(targetURL, "ws") 
+			log.Printf("[DEBUG] Attempting direct HTTP request to %s", healthCheckURL)
+			
+			httpResp, httpErr := http.Get(healthCheckURL)
+			if httpErr != nil {
+				log.Printf("[ERROR] Direct HTTP request also failed: %v", httpErr)
+			} else {
+				defer httpResp.Body.Close()
+				log.Printf("[DEBUG] Direct HTTP request succeeded with status: %d", httpResp.StatusCode)
+			}
+			
 			rw.Header().Set("Access-Control-Allow-Origin", "*")
-			http.Error(rw, "Failed to connect to backend", http.StatusBadGateway)
+			http.Error(rw, "Failed to connect to backend: "+err.Error(), http.StatusBadGateway)
 		}
 		return
 	}
@@ -1264,6 +1643,101 @@ func copyHeaders(dst, src http.Header) {
 	for k, vv := range src {
 		for _, v := range vv {
 			dst.Add(k, v)
+		}
+	}
+}
+
+// isWebSocketRequest checks if the request is a WebSocket upgrade request
+func isWebSocketRequest(req *http.Request) bool {
+	// Check for the Upgrade header
+	if strings.ToLower(req.Header.Get("Upgrade")) != "websocket" {
+		return false
+	}
+	
+	// Check for the Connection header containing upgrade
+	connectionHeader := strings.ToLower(req.Header.Get("Connection"))
+	if !strings.Contains(connectionHeader, "upgrade") {
+		return false
+	}
+	
+	// Check for the Sec-WebSocket-Key header which is required for WebSocket
+	if req.Header.Get("Sec-WebSocket-Key") == "" {
+		return false
+	}
+	
+	return true
+}
+
+// Helper function to run detailed diagnostics on service connectivity issues
+func (b *Balancer) runDetailedDiagnostics(service string) {
+	log.Printf("[INFO] Running detailed diagnostics for service: %s", service)
+	
+	// Test all important endpoints to diagnose issues
+	endpoints := []string{
+		"/",              // Root endpoint
+		"/health",        // Health check
+		b.MetricPath,     // Metrics endpoint
+		"/endpoints",     // Endpoints API
+		"/pods",          // Pods API
+		"/socket/agent",  // WebSocket endpoint
+	}
+	
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Don't follow redirects
+		},
+	}
+	
+	for _, endpoint := range endpoints {
+		url := service
+		if !strings.HasSuffix(url, "/") && !strings.HasPrefix(endpoint, "/") {
+			url += "/"
+		}
+		url += endpoint
+		
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			log.Printf("[ERROR] Diagnostic error creating request for %s: %v", url, err)
+			continue
+		}
+		
+		req.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
+		req.Header.Set("Accept", "application/json")
+		
+		log.Printf("[DEBUG] Diagnostic request to %s", url)
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[ERROR] Diagnostic failed for %s: %v", url, err)
+		} else {
+			body := "n/a"
+			if resp.Body != nil {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				if len(bodyBytes) > 0 {
+					if len(bodyBytes) > 500 {
+						body = string(bodyBytes[:500]) + "... [truncated]"
+					} else {
+						body = string(bodyBytes)
+					}
+				}
+				resp.Body.Close()
+			}
+			
+			log.Printf("[INFO] Diagnostic result for %s: Status=%d, Headers=%v, Body=%s", 
+				url, resp.StatusCode, resp.Header, body)
+		}
+	}
+	
+	// Check DNS resolution for the service hostname
+	serviceURL, err := url.Parse(service)
+	if err == nil && serviceURL.Hostname() != "" {
+		hostname := serviceURL.Hostname()
+		log.Printf("[DEBUG] Resolving hostname: %s", hostname)
+		ips, err := net.LookupIP(hostname)
+		if err != nil {
+			log.Printf("[ERROR] DNS resolution failed for %s: %v", hostname, err)
+		} else {
+			log.Printf("[INFO] DNS resolution for %s: %v", hostname, ips)
 		}
 	}
 }
