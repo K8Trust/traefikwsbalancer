@@ -200,14 +200,7 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	if len(serviceParts) == 0 {
 		return allPodMetrics, nil
 	}
-	headlessServiceName := serviceParts[0]
-	_ = headlessServiceName // currently not used further
-	namespace := "default"
-	_ = namespace // currently not used further
-	if len(serviceParts) > 1 {
-		namespace = serviceParts[1]
-	}
-
+	
 	// Create a dedicated discovery client with a shorter timeout.
 	discoveryClient := &http.Client{Timeout: b.DiscoveryTimeout}
 
@@ -281,48 +274,82 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 
 	// Pattern 3: Try IP scanning as a last resort (if enabled).
 	if initialPodMetrics.PodIP != "" && b.EnableIPScanning {
-		ipParts := strings.Split(initialPodMetrics.PodIP, ".")
-		if len(ipParts) == 4 {
-			baseIP := strings.Join(ipParts[:3], ".")
-			lastOctet, err := strconv.Atoi(ipParts[3])
-			if err == nil {
-				for offset := 1; offset <= 10; offset++ {
-					// Incrementing.
-					potentialIP := fmt.Sprintf("%s.%d", baseIP, lastOctet+offset)
-					potentialURL := fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
-					podResp, err := discoveryClient.Get(potentialURL)
-					if err == nil {
-						podBody, _ := io.ReadAll(podResp.Body)
-						podResp.Body.Close()
-						var podMetrics dashboard.PodMetrics
-						if err := json.Unmarshal(podBody, &podMetrics); err == nil && podMetrics.PodName != initialPodMetrics.PodName {
-							allPodMetrics = append(allPodMetrics, podMetrics)
-							log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning",
-								podMetrics.PodName, podMetrics.AgentsConnections)
-						}
-					}
-					// Decrementing.
-					if lastOctet-offset > 0 {
-						potentialIP = fmt.Sprintf("%s.%d", baseIP, lastOctet-offset)
-						potentialURL = fmt.Sprintf("http://%s%s", potentialIP, b.MetricPath)
-						podResp, err = discoveryClient.Get(potentialURL)
-						if err == nil {
-							podBody, _ := io.ReadAll(podResp.Body)
-							podResp.Body.Close()
-							var podMetrics dashboard.PodMetrics
-							if err := json.Unmarshal(podBody, &podMetrics); err == nil && podMetrics.PodName != initialPodMetrics.PodName {
-								allPodMetrics = append(allPodMetrics, podMetrics)
-								log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning",
-									podMetrics.PodName, podMetrics.AgentsConnections)
-							}
-						}
-					}
-				}
-			}
-		}
+		b.scanAdjacentIPs(discoveryClient, initialPodMetrics, &allPodMetrics)
 	}
 
 	return allPodMetrics, nil
+}
+
+// scanAdjacentIPs tries to discover pods by scanning IP addresses near the known pod
+func (b *Balancer) scanAdjacentIPs(client *http.Client, knownPod dashboard.PodMetrics, podList *[]dashboard.PodMetrics) {
+	ipParts := strings.Split(knownPod.PodIP, ".")
+	if len(ipParts) != 4 {
+		return
+	}
+	
+	// Scan the same subnet (fourth octet variations)
+	baseIP := strings.Join(ipParts[:3], ".")
+	lastOctet, err := strconv.Atoi(ipParts[3])
+	if err == nil {
+		for offset := 1; offset <= 10; offset++ {
+			// Incrementing
+			potentialIP := fmt.Sprintf("%s.%d", baseIP, lastOctet+offset)
+			b.scanSingleIP(client, potentialIP, knownPod.PodName, podList)
+			
+			// Decrementing
+			if lastOctet-offset > 0 {
+				potentialIP = fmt.Sprintf("%s.%d", baseIP, lastOctet-offset)
+				b.scanSingleIP(client, potentialIP, knownPod.PodName, podList)
+			}
+		}
+	}
+	
+	// Scan neighboring subnets (third octet variations)
+	thirdOctet, err := strconv.Atoi(ipParts[2])
+	if err == nil {
+		for thirdOffset := -5; thirdOffset <= 5; thirdOffset++ {
+			if thirdOffset == 0 {
+				continue // Skip current subnet, handled above
+			}
+			
+			newThirdOctet := thirdOctet + thirdOffset
+			if newThirdOctet < 0 || newThirdOctet > 255 {
+				continue
+			}
+			
+			for fourthOctet := 1; fourthOctet <= 20; fourthOctet++ {
+				newIP := fmt.Sprintf("%s.%s.%d.%d", ipParts[0], ipParts[1], newThirdOctet, fourthOctet)
+				b.scanSingleIP(client, newIP, knownPod.PodName, podList)
+			}
+		}
+	}
+}
+
+// scanSingleIP checks a single IP for a pod with metrics
+func (b *Balancer) scanSingleIP(client *http.Client, ip string, knownPodName string, podList *[]dashboard.PodMetrics) {
+	potentialURL := fmt.Sprintf("http://%s%s", ip, b.MetricPath)
+	podResp, err := client.Get(potentialURL)
+	if err != nil {
+		return
+	}
+	defer podResp.Body.Close()
+	
+	podBody, err := io.ReadAll(podResp.Body)
+	if err != nil {
+		return
+	}
+	
+	var podMetrics dashboard.PodMetrics
+	if err := json.Unmarshal(podBody, &podMetrics); err != nil {
+		return
+	}
+	
+	// Only add if it's not the pod we already know
+	if podMetrics.PodName != "" && podMetrics.PodName != knownPodName {
+		*podList = append(*podList, podMetrics)
+		log.Printf("[DEBUG] Discovered pod %s with %d connections via IP scanning",
+			podMetrics.PodName, podMetrics.AgentsConnections)
+	}
 }
 
 // getCachedConnections returns the cached connection count for a service.
