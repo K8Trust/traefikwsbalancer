@@ -203,6 +203,7 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	headlessServiceName := serviceParts[0]
 	_ = headlessServiceName // currently not used further
 	namespace := "default"
+	_ = namespace // currently not used further
 	if len(serviceParts) > 1 {
 		namespace = serviceParts[1]
 	}
@@ -330,6 +331,11 @@ func (b *Balancer) getCachedConnections(service string) (int, error) {
 		return count.(int), nil
 	}
 	return 0, fmt.Errorf("no cached count for service %s", service)
+}
+
+// InitializeCacheForTesting is a helper method to set up connection cache for tests.
+func (b *Balancer) InitializeCacheForTesting(service string, count int) {
+	b.connCache.Store(service, count)
 }
 
 // GetAllCachedConnections returns maps of service connection counts and pod metrics.

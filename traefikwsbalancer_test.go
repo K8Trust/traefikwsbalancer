@@ -61,7 +61,7 @@ func TestGetConnections(t *testing.T) {
 			}))
 			defer server.Close()
 
-			connections, err := cb.GetConnections(server.URL)
+			connections, _, err := cb.GetConnections(server.URL)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetConnections() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -126,6 +126,10 @@ func TestWebSocketConnection(t *testing.T) {
 		ReadTimeout:  2 * time.Second,
 	}
 
+	// Initialize the connection cache for testing
+	cb.GetConnections(backendServer.URL) // This will populate the cache via the MockFetcher
+	cb.InitializeCacheForTesting(backendServer.URL, 1) // Populate the cache with connections
+	
 	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cb.ServeHTTP(w, r)
 	}))
