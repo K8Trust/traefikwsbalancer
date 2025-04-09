@@ -123,7 +123,7 @@ func getHTMLTemplate(data MetricsData) string {
             </div>
             <div class="metric-card">
                 <div class="metric-label">Last Updated</div>
-                <div class="metric-value" style="font-size: 1.2em">` + time.Now().Format("15:04:05") + `</div>
+                <div class="metric-value" style="font-size: 1.2em">` + getJerusalemTime().Format("15:04:05") + `</div>
             </div>
         </div>
         <div class="refresh-info">
@@ -270,7 +270,7 @@ func PrepareMetricsData(
 	}
 	
 	return MetricsData{
-		Timestamp:           time.Now().Format(time.RFC3339),
+		Timestamp:           getJerusalemTime().Format(time.RFC3339),
 		Services:            services,
 		PodMetricsMap:       podMetricsMap,
 		TotalConnections:    totalConnections,
@@ -280,4 +280,14 @@ func PrepareMetricsData(
 		RefreshInterval:     10,
 		ForcedRefreshInterval: 30,
 	}
+}
+
+// getJerusalemTime returns the current time in Jerusalem (Israel) time zone
+func getJerusalemTime() time.Time {
+	loc, err := time.LoadLocation("Asia/Jerusalem")
+	if err != nil {
+		// Fallback to manual UTC+3 if time zone data not available
+		return time.Now().UTC().Add(3 * time.Hour)
+	}
+	return time.Now().In(loc)
 }

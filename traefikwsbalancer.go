@@ -631,10 +631,10 @@ func (b *Balancer) refreshServiceConnectionCount(service string) (int, error) {
 	}
 	b.MetricsMutex.Unlock()
 
-	// Update the connection count for this service
+	// Update the connection count for this service with Jerusalem time
 	b.CountMutex.Lock()
 	b.ConnectionCount[service] = totalConnections
-	b.LastRefresh[service] = time.Now()
+	b.LastRefresh[service] = time.Now() // Keep using UTC internally
 	b.CountMutex.Unlock()
 
 	return totalConnections, nil
@@ -868,7 +868,9 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 	}
 	lastRefresh := make(map[string]string)
 	for service, ts := range b.LastRefresh {
-		lastRefresh[service] = ts.Format(time.RFC3339)
+		// Format the last refresh time in Jerusalem time
+		jerusalemTime := getJerusalemTime(ts)
+		lastRefresh[service] = jerusalemTime.Format(time.RFC3339)
 	}
 	b.CountMutex.RUnlock()
 	
@@ -892,7 +894,7 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 		LastRefresh       map[string]string                 `json:"lastRefresh,omitempty"`
 		RefreshInterval   int                               `json:"refreshInterval"`
 	}{
-		Timestamp:       time.Now().Format(time.RFC3339),
+		Timestamp:       getJerusalemTime(time.Now()).Format(time.RFC3339),
 		Services:        make([]ServiceMetric, 0, len(serviceConnections)),
 		PodMetrics:      podMetricsMap,
 		LastRefresh:     lastRefresh,
@@ -916,6 +918,16 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 		http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
+}
+
+// getJerusalemTime converts a time to Jerusalem (Israel) time zone
+func getJerusalemTime(t time.Time) time.Time {
+	loc, err := time.LoadLocation("Asia/Jerusalem")
+	if err != nil {
+		// Fallback to manual UTC+3 if time zone data not available
+		return t.UTC().Add(3 * time.Hour)
+	}
+	return t.In(loc)
 }
 
 // handleHTMLMetricRequest serves the HTML dashboard for the metrics.
