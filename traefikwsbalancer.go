@@ -83,9 +83,9 @@ type Balancer struct {
 	updateMutex sync.Mutex
 
 	// Discovery configuration.
-	EnableIPScanning          bool
-	DiscoveryTimeout          time.Duration
-	TraefikProviderNamespace  string
+	EnableIPScanning         bool
+	DiscoveryTimeout         time.Duration
+	TraefikProviderNamespace string
 	
 	// Prometheus configuration
 	EnablePrometheusDiscovery bool
@@ -170,116 +170,116 @@ func (b *Balancer) GetConnections(service string) (int, []dashboard.PodMetrics, 
 
 // discoverPodsViaPrometheus attempts to discover pods by querying Traefik's Prometheus metrics endpoint
 func (b *Balancer) discoverPodsViaPrometheus(service string, discoveredPods map[string]bool) ([]dashboard.PodMetrics, error) {
-    // Skip this discovery method if it's disabled
-    if !b.EnablePrometheusDiscovery {
-        return nil, fmt.Errorf("Prometheus discovery disabled")
-    }
-    
-    log.Printf("[DEBUG] Attempting pod discovery via Traefik Prometheus metrics for %s", service)
-    
-    // Extract service name from the URL
-    serviceBase := strings.TrimPrefix(service, "http://")
-    serviceParts := strings.Split(serviceBase, ".")
-    if len(serviceParts) == 0 {
-        return nil, fmt.Errorf("invalid service URL format")
-    }
-    
-    headlessServiceName := serviceParts[0]
-    
-    // Use configured Prometheus URL
-    prometheusURL := b.PrometheusURL
-    
-    // Create a client with appropriate timeout
-    client := &http.Client{Timeout: b.DiscoveryTimeout}
-    
-    resp, err := client.Get(prometheusURL)
-    if err != nil {
-        log.Printf("[ERROR] Failed to fetch Prometheus metrics: %v", err)
-        return nil, err
-    }
-    defer resp.Body.Close()
-    
-    if resp.StatusCode != http.StatusOK {
-        log.Printf("[ERROR] Prometheus metrics endpoint returned non-OK status: %d", resp.StatusCode)
-        return nil, fmt.Errorf("metrics endpoint returned status %d", resp.StatusCode)
-    }
-    
-    // Read and parse the Prometheus metrics
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        log.Printf("[ERROR] Failed to read Prometheus metrics: %v", err)
-        return nil, err
-    }
-    
-    // Look for service-related metrics
-    // In Prometheus format, we're looking for metrics like:
-    // traefik_service_requests_total{code="200",method="GET",service="kbrain-socket-agent-ktrust-service@kubernetes"...}
-    
-    metrics := string(body)
-    var podMetricsMap = make(map[string]dashboard.PodMetrics)
-    var allPodMetrics []dashboard.PodMetrics
-    
-    // Split the metrics into lines
-    lines := strings.Split(metrics, "\n")
-    
-    // Search for lines containing our service name
-    servicePattern := fmt.Sprintf("service=\"%s@kubernetes\"", headlessServiceName)
-    serverPattern := "server=\"http://(\\d+\\.\\d+\\.\\d+\\.\\d+):"
-    
-    for _, line := range lines {
-        if strings.Contains(line, servicePattern) {
-            // This line contains information about our service
-            
-            // Extract server IP using regex
-            ipRegex := regexp.MustCompile(serverPattern)
-            matches := ipRegex.FindStringSubmatch(line)
-            
-            if len(matches) > 1 {
-                podIP := matches[1]
-                
-                // Try to fetch metrics from this pod
-                podURL := fmt.Sprintf("http://%s%s", podIP, b.MetricPath)
-                podResp, err := client.Get(podURL)
-                
-                if err == nil {
-                    podBody, err := io.ReadAll(podResp.Body)
-                    podResp.Body.Close()
-                    
-                    if err == nil {
-                        var podMetrics dashboard.PodMetrics
-                        if json.Unmarshal(podBody, &podMetrics) == nil {
-                            if podMetrics.PodName == "" {
-                                // If pod name is not available, generate one from IP
-                                podMetrics.PodName = fmt.Sprintf("pod-ip-%s", podIP)
-                            }
-                            
-                            if podMetrics.PodIP == "" {
-                                podMetrics.PodIP = podIP
-                            }
-                            
-                            // Only add if we haven't seen this pod before
-                            if _, exists := podMetricsMap[podMetrics.PodName]; !exists {
-                                if _, seen := discoveredPods[podMetrics.PodName]; !seen {
-                                    podMetricsMap[podMetrics.PodName] = podMetrics
-                                    log.Printf("[DEBUG] Discovered pod %s with %d connections via Prometheus metrics",
-                                        podMetrics.PodName, podMetrics.AgentsConnections)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Convert map to slice
-    for _, podMetrics := range podMetricsMap {
-        allPodMetrics = append(allPodMetrics, podMetrics)
-        discoveredPods[podMetrics.PodName] = true
-    }
-    
-    log.Printf("[DEBUG] Found %d pods via Prometheus metrics", len(allPodMetrics))
-    return allPodMetrics, nil
+	// Skip this discovery method if it's disabled
+	if !b.EnablePrometheusDiscovery {
+		return nil, fmt.Errorf("Prometheus discovery disabled")
+	}
+	
+	log.Printf("[DEBUG] Attempting pod discovery via Traefik Prometheus metrics for %s", service)
+	
+	// Extract service name from the URL
+	serviceBase := strings.TrimPrefix(service, "http://")
+	serviceParts := strings.Split(serviceBase, ".")
+	if len(serviceParts) == 0 {
+		return nil, fmt.Errorf("invalid service URL format")
+	}
+	
+	headlessServiceName := serviceParts[0]
+	
+	// Use configured Prometheus URL
+	prometheusURL := b.PrometheusURL
+	
+	// Create a client with appropriate timeout
+	client := &http.Client{Timeout: b.DiscoveryTimeout}
+	
+	resp, err := client.Get(prometheusURL)
+	if err != nil {
+		log.Printf("[ERROR] Failed to fetch Prometheus metrics: %v", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[ERROR] Prometheus metrics endpoint returned non-OK status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("metrics endpoint returned status %d", resp.StatusCode)
+	}
+	
+	// Read and parse the Prometheus metrics
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("[ERROR] Failed to read Prometheus metrics: %v", err)
+		return nil, err
+	}
+	
+	// Look for service-related metrics
+	// In Prometheus format, we're looking for metrics like:
+	// traefik_service_requests_total{code="200",method="GET",service="kbrain-socket-agent-ktrust-service@kubernetes"...}
+	
+	metrics := string(body)
+	var podMetricsMap = make(map[string]dashboard.PodMetrics)
+	var allPodMetrics []dashboard.PodMetrics
+	
+	// Split the metrics into lines
+	lines := strings.Split(metrics, "\n")
+	
+	// Search for lines containing our service name
+	servicePattern := fmt.Sprintf("service=\"%s@kubernetes\"", headlessServiceName)
+	serverPattern := "server=\"http://(\\d+\\.\\d+\\.\\d+\\.\\d+):"
+	
+	for _, line := range lines {
+		if strings.Contains(line, servicePattern) {
+			// This line contains information about our service
+			
+			// Extract server IP using regex
+			ipRegex := regexp.MustCompile(serverPattern)
+			matches := ipRegex.FindStringSubmatch(line)
+			
+			if len(matches) > 1 {
+				podIP := matches[1]
+				
+				// Try to fetch metrics from this pod
+				podURL := fmt.Sprintf("http://%s%s", podIP, b.MetricPath)
+				podResp, err := client.Get(podURL)
+				
+				if err == nil {
+					podBody, err := io.ReadAll(podResp.Body)
+					podResp.Body.Close()
+					
+					if err == nil {
+						var podMetrics dashboard.PodMetrics
+						if json.Unmarshal(podBody, &podMetrics) == nil {
+							if podMetrics.PodName == "" {
+								// If pod name is not available, generate one from IP
+								podMetrics.PodName = fmt.Sprintf("pod-ip-%s", podIP)
+							}
+							
+							if podMetrics.PodIP == "" {
+								podMetrics.PodIP = podIP
+							}
+							
+							// Only add if we haven't seen this pod before
+							if _, exists := podMetricsMap[podMetrics.PodName]; !exists {
+								if _, seen := discoveredPods[podMetrics.PodName]; !seen {
+									podMetricsMap[podMetrics.PodName] = podMetrics
+									log.Printf("[DEBUG] Discovered pod %s with %d connections via Prometheus metrics",
+										podMetrics.PodName, podMetrics.AgentsConnections)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Convert map to slice
+	for _, podMetrics := range podMetricsMap {
+		allPodMetrics = append(allPodMetrics, podMetrics)
+		discoveredPods[podMetrics.PodName] = true
+	}
+	
+	log.Printf("[DEBUG] Found %d pods via Prometheus metrics", len(allPodMetrics))
+	return allPodMetrics, nil
 }
 
 // GetAllPodsForService discovers all pods behind a service and fetches their metrics.
@@ -326,23 +326,23 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 		initialPodMetrics.PodName: true,
 	}
 
-    // New Step: Try Prometheus metrics discovery first (it's most reliable when available)
-    prometheusMetrics, err := b.discoverPodsViaPrometheus(service, discoveredPods)
-    if err == nil && len(prometheusMetrics) > 0 {
-        for _, podMetric := range prometheusMetrics {
-            if _, seen := discoveredPods[podMetric.PodName]; !seen {
-                allPodMetrics = append(allPodMetrics, podMetric)
-                discoveredPods[podMetric.PodName] = true
-            }
-        }
-        
-        // If we found additional pods via Prometheus, we might be done
-        if len(allPodMetrics) > 1 {
-            log.Printf("[DEBUG] Successfully discovered %d pods via Prometheus metrics", len(allPodMetrics))
-            // If we have more than one pod, we can return early and skip the other discovery methods
-            return allPodMetrics, nil
-        }
-    }
+	// New Step: Try Prometheus metrics discovery first (it's most reliable when available)
+	prometheusMetrics, err := b.discoverPodsViaPrometheus(service, discoveredPods)
+	if err == nil && len(prometheusMetrics) > 0 {
+		for _, podMetric := range prometheusMetrics {
+			if _, seen := discoveredPods[podMetric.PodName]; !seen {
+				allPodMetrics = append(allPodMetrics, podMetric)
+				discoveredPods[podMetric.PodName] = true
+			}
+		}
+		
+		// If we found additional pods via Prometheus, we might be done
+		if len(allPodMetrics) > 1 {
+			log.Printf("[DEBUG] Successfully discovered %d pods via Prometheus metrics", len(allPodMetrics))
+			// If we have more than one pod, we can return early and skip the other discovery methods
+			return allPodMetrics, nil
+		}
+	}
 
 	// Extract service DNS name for later use
 	serviceBase := strings.TrimPrefix(service, "http://")
@@ -602,76 +602,6 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 				}
 			}
 		}
-	}
-
-	// Try direct pod DNS naming
-	if len(discoveredPods) < 2 {
-		log.Printf("[DEBUG] Attempting discovery via DNS pattern for %s", baseName)
-		// Try a range of pod indices to discover more pods
-		for i := 0; i < 20; i++ {
-			// For pod names with numeric indices at the end (e.g., kbrain-socket-agent-65fdc7655f-0)
-            potentialPodName := fmt.Sprintf("%s-%d", baseName, i)
-            if _, seen := discoveredPods[potentialPodName]; seen {
-                continue // Skip already discovered pods
-            }
-            
-            // Try both the full qualified domain name and direct pod name
-            var potentialURLs []string
-            
-            if b.TraefikProviderNamespace != "" {
-                // Use the configured namespace
-                potentialURLs = []string{
-                    // Using the full FQDN pattern
-                    fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local%s", 
-                        baseName, i, headlessServiceName, b.TraefikProviderNamespace, b.MetricPath),
-                    // Direct pod name - simpler approach
-                    fmt.Sprintf("http://%s-%d%s", baseName, i, b.MetricPath),
-                }
-            } else {
-                // Use the extracted namespace
-                potentialURLs = []string{
-                    // Using the full FQDN pattern 
-                    fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local%s", 
-                        baseName, i, headlessServiceName, namespace, b.MetricPath),
-                    // Try with the service base domain
-                    fmt.Sprintf("http://%s-%d.%s%s", baseName, i, serviceBase, b.MetricPath),
-                    // Direct pod name - simpler approach
-                    fmt.Sprintf("http://%s-%d%s", baseName, i, b.MetricPath),
-                }
-            }
-			for _, potentialURL := range potentialURLs {
-                log.Printf("[DEBUG] Trying to discover pod via DNS: %s", potentialURL)
-                podResp, err := discoveryClient.Get(potentialURL)
-                if err != nil {
-                    continue
-                }
-                
-                podBody, err := io.ReadAll(podResp.Body)
-                podResp.Body.Close()
-                if err != nil {
-                    log.Printf("[ERROR] Failed to read response from pod %s: %v", potentialURL, err)
-                    continue
-                }
-                
-                var podMetrics dashboard.PodMetrics
-                if err := json.Unmarshal(podBody, &podMetrics); err != nil {
-                    log.Printf("[ERROR] Failed to decode metrics from pod %s: %v", potentialURL, err)
-                    continue
-                }
-                
-                if podMetrics.PodName == "" {
-                    podMetrics.PodName = potentialPodName
-                }
-                
-                if _, seen := discoveredPods[podMetrics.PodName]; !seen {
-                    allPodMetrics = append(allPodMetrics, podMetrics)
-                    discoveredPods[podMetrics.PodName] = true
-                    log.Printf("[DEBUG] Discovered pod %s with %d connections via DNS",
-                        podMetrics.PodName, podMetrics.AgentsConnections)
-                    break // Found a working URL for this pod index, move to next index
-                }
-            }
-        }
 	}
 
 	// Use IP scanning (if enabled)
@@ -1076,4 +1006,3 @@ func copyHeaders(dst, src http.Header) {
 		}
 	}
 }
-
