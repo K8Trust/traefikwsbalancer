@@ -82,6 +82,18 @@ func getHTMLHeader() string {
             border-radius: 5px;
             text-align: center;
         }
+        .refresh-info {
+            background-color: #f0f7fa;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 10px;
+            font-size: 0.85em;
+            color: #2c3e50;
+        }
+        .refresh-info span {
+            font-weight: bold;
+            color: #16a085;
+        }
         .metric-value {
             font-size: 2em;
             font-weight: bold;

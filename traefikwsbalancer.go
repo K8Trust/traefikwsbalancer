@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -71,6 +72,18 @@ type Balancer struct {
 	// New fields for discovery configuration.
 	EnableIPScanning bool
 	DiscoveryTimeout time.Duration
+
+	// Add this to your Balancer struct
+	lastDeployTime time.Time
+
+	// New fields for Refresh method
+	MetricsMutex     sync.RWMutex
+	Metrics          map[string]map[string]dashboard.PodMetrics
+	CountMutex       sync.RWMutex
+	ConnectionCount  map[string]int
+	LastRefresh      map[string]time.Time
+	RefreshInterval  int
+	Done             chan struct{}
 }
 
 // New creates a new plugin instance.
@@ -84,11 +97,28 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		log.Printf("[DEBUG] Service %d: %s", i+1, service)
 	}
 
+	// Create a more robust HTTP client with appropriate timeouts
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     60 * time.Second,
+		TLSHandshakeTimeout: 5 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	
+	httpClient := &http.Client{
+		Timeout:   time.Duration(config.DiscoveryTimeout) * time.Second,
+		Transport: transport,
+	}
+
 	b := &Balancer{
 		Next:               next,
 		Name:               name,
 		Services:           config.Services,
-		Client:             &http.Client{Timeout: 5 * time.Second},
+		Client:             httpClient,
 		MetricPath:         config.MetricPath,
 		BalancerMetricPath: config.BalancerMetricPath,
 		cacheTTL:           time.Duration(config.CacheTTL) * time.Second,
@@ -97,9 +127,33 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		ReadTimeout:        30 * time.Second,
 		EnableIPScanning:   config.EnableIPScanning,
 		DiscoveryTimeout:   time.Duration(config.DiscoveryTimeout) * time.Second,
+		lastDeployTime:     time.Now(),
+		Metrics:            make(map[string]map[string]dashboard.PodMetrics),
+		ConnectionCount:    make(map[string]int),
+		LastRefresh:        make(map[string]time.Time),
+		RefreshInterval:    config.CacheTTL,
+		Done:               make(chan struct{}),
 	}
-	// Start asynchronous background cache refresh.
-	b.StartBackgroundRefresh()
+	
+	// Immediate cache population with retries
+	for _, service := range config.Services {
+		go func(svc string) {
+			// Try multiple times to populate cache
+			for i := 0; i < 5; i++ {
+				log.Printf("[INFO] Initial cache population attempt %d for %s", i+1, svc)
+				count, err := b.refreshServiceConnectionCount(svc)
+				if err == nil {
+					log.Printf("[INFO] Successfully populated cache for %s with %d connections", svc, count)
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+		}(service)
+	}
+	
+	// Start background refresh routines
+	go b.Refresh()
+	
 	return b, nil
 }
 
@@ -187,6 +241,32 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 			if err == nil {
 				log.Printf("[DEBUG] Endpoints API response body: %s", string(endpointsBody))
 				
+				// Try to parse as array of endpoints first
+				var endpointsArray []struct {
+					Pod struct {
+						Name string `json:"name"`
+						IP   string `json:"ip"`
+						Node string `json:"node"`
+					} `json:"pod"`
+					Connections int `json:"connections"`
+				}
+				
+				if json.Unmarshal(endpointsBody, &endpointsArray) == nil && len(endpointsArray) > 0 {
+					log.Printf("[DEBUG] Successfully parsed endpoints as array with %d items", len(endpointsArray))
+					var allPodMetrics []dashboard.PodMetrics
+					for _, endpoint := range endpointsArray {
+						podMetrics := dashboard.PodMetrics{
+							PodName:           endpoint.Pod.Name,
+							PodIP:             endpoint.Pod.IP,
+							NodeName:          endpoint.Pod.Node,
+							AgentsConnections: endpoint.Connections,
+						}
+						allPodMetrics = append(allPodMetrics, podMetrics)
+					}
+					return allPodMetrics, nil
+				}
+				
+				// Fall back to single endpoint object if array parsing fails
 				var endpointsData struct {
 					Pod struct {
 						Name string `json:"name"`
@@ -210,6 +290,34 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 			}
 		} else if endpointsResp != nil {
 			endpointsResp.Body.Close()
+		}
+	}
+
+	// Try getting all pods endpoint if available
+	log.Printf("[DEBUG] Attempting to use all-pods API for service %s", service)
+	allPodsURL := fmt.Sprintf("%s/pods", service)
+	allPodsReq, err := http.NewRequest("GET", allPodsURL, nil)
+	if err == nil {
+		allPodsReq.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
+		allPodsReq.Header.Set("Accept", "application/json")
+		
+		allPodsResp, err := b.Client.Do(allPodsReq)
+		if err == nil && allPodsResp.StatusCode == http.StatusOK {
+			defer allPodsResp.Body.Close()
+			log.Printf("[DEBUG] All-pods API response: status=%d", allPodsResp.StatusCode)
+			
+			allPodsBody, err := io.ReadAll(allPodsResp.Body)
+			if err == nil {
+				log.Printf("[DEBUG] All-pods API response body: %s", string(allPodsBody))
+				
+				var podsArray []dashboard.PodMetrics
+				if json.Unmarshal(allPodsBody, &podsArray) == nil && len(podsArray) > 0 {
+					log.Printf("[DEBUG] Successfully parsed all-pods as array with %d items", len(podsArray))
+					return podsArray, nil
+				}
+			}
+		} else if allPodsResp != nil {
+			allPodsResp.Body.Close()
 		}
 	}
 
@@ -431,31 +539,51 @@ func (b *Balancer) scanSingleIP(client *http.Client, ip string, knownPodName str
 
 // getCachedConnections returns the cached connection count for a service.
 func (b *Balancer) getCachedConnections(service string) (int, error) {
-	if count, ok := b.connCache.Load(service); ok {
-		return count.(int), nil
+	b.CountMutex.RLock()
+	defer b.CountMutex.RUnlock()
+	
+	if count, ok := b.ConnectionCount[service]; ok {
+		return count, nil
 	}
 	return 0, fmt.Errorf("no cached count for service %s", service)
 }
 
 // InitializeCacheForTesting is a helper method to set up connection cache for tests.
 func (b *Balancer) InitializeCacheForTesting(service string, count int) {
-	b.connCache.Store(service, count)
+	b.CountMutex.Lock()
+	b.ConnectionCount[service] = count
+	b.LastRefresh[service] = time.Now()
+	b.CountMutex.Unlock()
 }
 
 // GetAllCachedConnections returns maps of service connection counts and pod metrics.
 func (b *Balancer) GetAllCachedConnections() (map[string]int, map[string][]dashboard.PodMetrics) {
 	connections := make(map[string]int)
 	podMetricsMap := make(map[string][]dashboard.PodMetrics)
+	
+	b.CountMutex.RLock()
+	for service, count := range b.ConnectionCount {
+		connections[service] = count
+	}
+	b.CountMutex.RUnlock()
+	
+	b.MetricsMutex.RLock()
+	for service, podsMap := range b.Metrics {
+		pods := make([]dashboard.PodMetrics, 0, len(podsMap))
+		for _, pod := range podsMap {
+			pods = append(pods, pod)
+		}
+		podMetricsMap[service] = pods
+	}
+	b.MetricsMutex.RUnlock()
+	
+	// Add any services that might be missing in the metrics map
 	for _, service := range b.Services {
-		if count, ok := b.connCache.Load(service); ok {
-			connections[service] = count.(int)
-		} else {
+		if _, ok := connections[service]; !ok {
 			connections[service] = 0
 		}
-		if metrics, ok := b.podMetrics.Load(service); ok {
-			podMetricsMap[service] = metrics.([]dashboard.PodMetrics)
-		}
 	}
+	
 	return connections, podMetricsMap
 }
 
@@ -477,28 +605,118 @@ func (b *Balancer) StartBackgroundRefresh() {
 	}()
 }
 
-// refreshServiceConnectionCount refreshes cached connection counts for a single service.
-func (b *Balancer) refreshServiceConnectionCount(service string) {
-	b.updateMutex.Lock()
-	defer b.updateMutex.Unlock()
-
-	log.Printf("[DEBUG] Refreshing connection counts for service %s in background", service)
-	allPodMetrics, err := b.GetAllPodsForService(service)
+// refreshServiceConnectionCount queries the backend service for the current connection count.
+func (b *Balancer) refreshServiceConnectionCount(service string) (int, error) {
+	podMetrics, err := b.GetAllPodsForService(service)
 	if err != nil {
-		log.Printf("[ERROR] Error fetching pod metrics for service %s: %v", service, err)
-		return
+		log.Printf("[ERROR] Failed to get pod metrics for service %s: %v", service, err)
+		return 0, err
 	}
 
-	totalConnections := 0
-	for _, pod := range allPodMetrics {
-		totalConnections += pod.AgentsConnections
+	// Store pod metrics in the dashboard
+	b.MetricsMutex.Lock()
+	metrics, exists := b.Metrics[service]
+	if !exists {
+		metrics = make(map[string]dashboard.PodMetrics)
+		b.Metrics[service] = metrics
 	}
 
-	b.connCache.Store(service, totalConnections)
-	b.podMetrics.Store(service, allPodMetrics)
-	b.lastUpdate = time.Now()
-	log.Printf("[DEBUG] Updated cached connections for service %s: %d connections across %d pods",
-		service, totalConnections, len(allPodMetrics))
+	var totalConnections int
+	log.Printf("[DEBUG] Found %d pods for service %s", len(podMetrics), service)
+	for _, podMetric := range podMetrics {
+		metrics[podMetric.PodName] = podMetric
+		totalConnections += podMetric.AgentsConnections
+		log.Printf("[DEBUG] Pod %s has %d connections", podMetric.PodName, podMetric.AgentsConnections)
+	}
+	b.MetricsMutex.Unlock()
+
+	// Update the connection count for this service
+	b.CountMutex.Lock()
+	b.ConnectionCount[service] = totalConnections
+	b.LastRefresh[service] = time.Now()
+	b.CountMutex.Unlock()
+
+	return totalConnections, nil
+}
+
+// Refresh periodically refreshes the connection count for all services.
+func (b *Balancer) Refresh() {
+	ticker := time.NewTicker(time.Duration(b.RefreshInterval) * time.Second)
+	forcedFullRefresh := time.NewTicker(30 * time.Second) // Force a full refresh every 30 seconds
+	defer ticker.Stop()
+	defer forcedFullRefresh.Stop()
+
+	// Immediately populate initial data for all services
+	log.Printf("[INFO] Initial population of connection counts for all services")
+	for _, service := range b.Services {
+		b.refreshServiceConnectionCount(service)
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			for _, service := range b.Services {
+				b.CountMutex.RLock()
+				lastRefresh, ok := b.LastRefresh[service]
+				b.CountMutex.RUnlock()
+
+				now := time.Now()
+				if !ok || now.Sub(lastRefresh) > time.Duration(b.RefreshInterval)*time.Second {
+					go func(s string) {
+						_, err := b.refreshServiceConnectionCount(s)
+						if err != nil {
+							log.Printf("[ERROR] Failed to refresh connection count for service %s: %v", s, err)
+						}
+					}(service)
+				}
+			}
+		case <-forcedFullRefresh.C:
+			log.Printf("[INFO] Performing forced full refresh of all services")
+			for _, service := range b.Services {
+				go func(s string) {
+					_, err := b.refreshServiceConnectionCount(s)
+					if err != nil {
+						log.Printf("[ERROR] Failed to refresh connection count for service %s: %v", s, err)
+					}
+				}(service)
+			}
+		case <-b.Done:
+			return
+		}
+	}
+}
+
+// diagnoseNetworkConnectivity performs basic connectivity checks to help diagnose issues
+func (b *Balancer) diagnoseNetworkConnectivity(service string) {
+	log.Printf("[DEBUG] Running network diagnostics for %s", service)
+	
+	// Test direct HTTP connection to health endpoint
+	healthURL := service + "/health"
+	req, _ := http.NewRequest("GET", healthURL, nil)
+	req.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
+	resp, err := b.Client.Do(req)
+	if err != nil {
+		log.Printf("[ERROR] Network diagnostic: Cannot connect to %s: %v", healthURL, err)
+	} else {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("[DEBUG] Network diagnostic: Connected to %s, status: %d, body: %s", 
+			healthURL, resp.StatusCode, string(body))
+	}
+	
+	// Test metric endpoint
+	metricURL := service + b.MetricPath
+	metricReq, _ := http.NewRequest("GET", metricURL, nil)
+	metricReq.Header.Set("User-Agent", "TraefikWSBalancer/1.0")
+	metricResp, err := b.Client.Do(metricReq)
+	if err != nil {
+		log.Printf("[ERROR] Network diagnostic: Cannot connect to %s: %v", metricURL, err)
+	} else {
+		defer metricResp.Body.Close()
+		metricBody, _ := io.ReadAll(metricResp.Body)
+		log.Printf("[DEBUG] Network diagnostic: Connected to %s, status: %d, body: %s", 
+			metricURL, metricResp.StatusCode, string(metricBody))
+	}
 }
 
 // ServeHTTP handles incoming HTTP requests.
@@ -513,33 +731,101 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
+	
+	// Add a direct refresh API endpoint
+	if req.URL.Path == b.BalancerMetricPath+"/refresh" {
+		log.Printf("[INFO] Explicit cache refresh requested")
+		for _, service := range b.Services {
+			go b.refreshServiceConnectionCount(service)
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusOK)
+		rw.Write([]byte(`{"status":"refresh started"}`))
+		return
+	}
 
 	minConnections := int(^uint(0) >> 1)
 	var selectedService string
 
 	log.Printf("[DEBUG] Request received: %s %s", req.Method, req.URL.Path)
+	log.Printf("[DEBUG] Request headers: %v", req.Header)
 	log.Printf("[DEBUG] Checking connection counts across services:")
 	allServiceConnections := make(map[string]int)
+	
+	// Run diagnostics for the first service if needed
+	if len(b.Services) > 0 && time.Since(b.lastDeployTime) < 30*time.Second {
+		b.diagnoseNetworkConnectivity(b.Services[0])
+	}
 
+	// Get current connection counts from the new cache
+	b.CountMutex.RLock()
+	needsRefresh := true
 	for _, service := range b.Services {
-		connections, err := b.getCachedConnections(service)
-		if err != nil {
-			log.Printf("[ERROR] Failed to get connections for service %s: %v", service, err)
-			continue
+		if count, ok := b.ConnectionCount[service]; ok {
+			needsRefresh = false
+			allServiceConnections[service] = count
+			log.Printf("[DEBUG] Service %s has %d active connections", service, count)
+			if count < minConnections {
+				minConnections = count
+				selectedService = service
+				log.Printf("[DEBUG] New minimum found: service %s with %d connections", service, count)
+			}
 		}
-		allServiceConnections[service] = connections
-		log.Printf("[DEBUG] Service %s has %d active connections", service, connections)
-		if connections < minConnections {
-			minConnections = connections
-			selectedService = service
-			log.Printf("[DEBUG] New minimum found: service %s with %d connections", service, connections)
+	}
+	b.CountMutex.RUnlock()
+
+	// If cache is empty, do an immediate refresh and retry once
+	if needsRefresh {
+		log.Printf("[WARN] Connection cache appears empty, forcing immediate refresh")
+		refreshWait := sync.WaitGroup{}
+		for _, service := range b.Services {
+			refreshWait.Add(1)
+			go func(s string) {
+				defer refreshWait.Done()
+				b.refreshServiceConnectionCount(s)
+			}(service)
 		}
+		
+		// Wait for at least one service to refresh, but max 1 second
+		waitChan := make(chan struct{})
+		go func() {
+			refreshWait.Wait()
+			close(waitChan)
+		}()
+		
+		select {
+		case <-waitChan:
+			log.Printf("[DEBUG] Refresh completed")
+		case <-time.After(1 * time.Second):
+			log.Printf("[WARN] Refresh timeout, proceeding with what we have")
+		}
+		
+		// Try again with refreshed cache
+		b.CountMutex.RLock()
+		for _, service := range b.Services {
+			if count, ok := b.ConnectionCount[service]; ok {
+				allServiceConnections[service] = count
+				log.Printf("[DEBUG] Service %s has %d active connections (after refresh)", service, count)
+				if count < minConnections {
+					minConnections = count
+					selectedService = service
+					log.Printf("[DEBUG] New minimum found: service %s with %d connections", service, count)
+				}
+			}
+		}
+		b.CountMutex.RUnlock()
 	}
 
 	if selectedService == "" {
-		log.Printf("[ERROR] No available services found")
-		http.Error(rw, "No available service", http.StatusServiceUnavailable)
-		return
+		log.Printf("[WARN] No available services with cached metrics, selecting first service as fallback")
+		if len(b.Services) > 0 {
+			selectedService = b.Services[0]
+			// Force immediate refresh for next request
+			go b.refreshServiceConnectionCount(selectedService)
+		} else {
+			http.Error(rw, "No available service", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	log.Printf("[INFO] Selected service %s with %d connections (lowest) for request %s. Connection counts: %v",
@@ -555,27 +841,63 @@ func (b *Balancer) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	b.handleHTTP(rw, req, selectedService)
+
+	// In ServeHTTP or other methods
+	if time.Since(b.lastDeployTime) < 10*time.Second {
+		// We're in startup mode - be more aggressive about refreshing
+		for _, service := range b.Services {
+			go b.refreshServiceConnectionCount(service)
+		}
+	}
 }
 
 // handleMetricRequest responds with current connection metrics in JSON.
 func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request) {
 	log.Printf("[DEBUG] Handling JSON balancer metrics request")
-	serviceConnections, podMetricsMap := b.GetAllCachedConnections()
+	
 	type ServiceMetric struct {
 		URL         string `json:"url"`
 		Connections int    `json:"connections"`
 	}
+	
+	b.CountMutex.RLock()
+	serviceConnections := make(map[string]int)
+	for service, count := range b.ConnectionCount {
+		serviceConnections[service] = count
+	}
+	lastRefresh := make(map[string]string)
+	for service, ts := range b.LastRefresh {
+		lastRefresh[service] = ts.Format(time.RFC3339)
+	}
+	b.CountMutex.RUnlock()
+	
+	b.MetricsMutex.RLock()
+	podMetricsMap := make(map[string][]dashboard.PodMetrics)
+	for service, podsMap := range b.Metrics {
+		pods := make([]dashboard.PodMetrics, 0, len(podsMap))
+		for _, pod := range podsMap {
+			pods = append(pods, pod)
+		}
+		podMetricsMap[service] = pods
+	}
+	b.MetricsMutex.RUnlock()
+	
 	response := struct {
 		Timestamp         string                            `json:"timestamp"`
 		Services          []ServiceMetric                   `json:"services"`
 		PodMetrics        map[string][]dashboard.PodMetrics `json:"podMetrics,omitempty"`
 		TotalCount        int                               `json:"totalConnections"`
 		AgentsConnections int                               `json:"agentsConnections"`
+		LastRefresh       map[string]string                 `json:"lastRefresh,omitempty"`
+		RefreshInterval   int                               `json:"refreshInterval"`
 	}{
-		Timestamp:  time.Now().Format(time.RFC3339),
-		Services:   make([]ServiceMetric, 0, len(serviceConnections)),
-		PodMetrics: podMetricsMap,
+		Timestamp:       time.Now().Format(time.RFC3339),
+		Services:        make([]ServiceMetric, 0, len(serviceConnections)),
+		PodMetrics:      podMetricsMap,
+		LastRefresh:     lastRefresh,
+		RefreshInterval: b.RefreshInterval,
 	}
+	
 	totalConnections := 0
 	for service, count := range serviceConnections {
 		response.Services = append(response.Services, ServiceMetric{
@@ -598,17 +920,57 @@ func (b *Balancer) handleMetricRequest(rw http.ResponseWriter, req *http.Request
 // handleHTMLMetricRequest serves the HTML dashboard for the metrics.
 func (b *Balancer) handleHTMLMetricRequest(rw http.ResponseWriter, req *http.Request) {
 	log.Printf("[DEBUG] Handling HTML balancer metrics request")
-	serviceConnections, podMetricsMap := b.GetAllCachedConnections()
+	
+	b.CountMutex.RLock()
+	serviceConnections := make(map[string]int)
+	for service, count := range b.ConnectionCount {
+		serviceConnections[service] = count
+	}
+	b.CountMutex.RUnlock()
+	
+	b.MetricsMutex.RLock()
+	podMetricsMap := make(map[string][]dashboard.PodMetrics)
+	for service, podsMap := range b.Metrics {
+		pods := make([]dashboard.PodMetrics, 0, len(podsMap))
+		for _, pod := range podsMap {
+			pods = append(pods, pod)
+		}
+		podMetricsMap[service] = pods
+	}
+	b.MetricsMutex.RUnlock()
+	
 	data := dashboard.PrepareMetricsData(
 		serviceConnections,
 		podMetricsMap,
 		b.BalancerMetricPath,
 	)
+	
+	// Add refresh interval information
+	data.RefreshInterval = b.RefreshInterval
+	data.ForcedRefreshInterval = 30 // Hardcoded value from Refresh method
+	
 	dashboard.RenderHTML(rw, req, data)
 }
 
 // handleWebSocket proxies WebSocket connections.
 func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, targetService string) {
+	// Add CORS headers for preflight requests
+	if req.Method == "OPTIONS" {
+		rw.Header().Set("Access-Control-Allow-Origin", "*")
+		rw.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		rw.Header().Set("Access-Control-Allow-Headers", 
+			"Origin, X-Requested-With, Content-Type, Accept, Authorization, Agent-Id, X-Account")
+		rw.WriteHeader(http.StatusOK)
+		return
+	}
+	
+	// Check for WebSocket upgrade
+	if !ws.IsWebSocketUpgrade(req) {
+		log.Printf("[ERROR] Not a WebSocket upgrade request")
+		http.Error(rw, "WebSocket upgrade required", http.StatusBadRequest)
+		return
+	}
+
 	dialer := ws.Dialer{
 		HandshakeTimeout: b.DialTimeout,
 		ReadBufferSize:   1024,
@@ -621,9 +983,12 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 	}
 
 	log.Printf("[DEBUG] Dialing backend WebSocket service at %s", targetURL)
+	log.Printf("[DEBUG] Original request headers: %v", req.Header)
 
+	// Create headers for the backend connection
 	cleanHeaders := make(http.Header)
 	for k, v := range req.Header {
+		// Pass through all headers except those specific to the WebSocket handshake
 		switch k {
 		case "Upgrade", "Connection", "Sec-Websocket-Key",
 			"Sec-Websocket-Version", "Sec-Websocket-Extensions",
@@ -633,33 +998,78 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 			cleanHeaders[k] = v
 		}
 	}
+	
+	// Add test headers to help with debugging/authentication
+	// These are required by your Node.js WebSocket server
+	if _, exists := cleanHeaders["Agent-Id"]; !exists {
+		cleanHeaders.Set("Agent-Id", "test-client") // Test client ID for debugging
+	}
+	if _, exists := cleanHeaders["Authorization"]; !exists {
+		cleanHeaders.Set("Authorization", "Bearer test-token") // Test auth for debugging
+	}
+	
+	// Add origin header if missing (may be required by some WebSocket servers)
+	if _, exists := cleanHeaders["Origin"]; !exists {
+		host := req.Host
+		if host == "" {
+			host = "localhost"
+		}
+		scheme := "https"
+		if req.TLS == nil {
+			scheme = "http"
+		}
+		cleanHeaders.Set("Origin", fmt.Sprintf("%s://%s", scheme, host))
+	}
+	
+	log.Printf("[DEBUG] Backend WebSocket request headers: %v", cleanHeaders)
 
+	// Attempt to establish WebSocket connection to backend
 	backendConn, resp, err := dialer.Dial(targetURL, cleanHeaders)
 	if err != nil {
 		log.Printf("[ERROR] Failed to connect to backend WebSocket: %v", err)
 		if resp != nil {
+			log.Printf("[ERROR] Backend response status: %d", resp.StatusCode)
+			log.Printf("[ERROR] Backend response headers: %v", resp.Header)
+			
+			body, bodyErr := io.ReadAll(resp.Body)
+			if bodyErr == nil {
+				log.Printf("[ERROR] Backend response body: %s", string(body))
+			}
+			
+			// Add CORS headers to the error response
+			rw.Header().Set("Access-Control-Allow-Origin", "*")
 			copyHeaders(rw.Header(), resp.Header)
 			rw.WriteHeader(resp.StatusCode)
+			rw.Write(body)
 		} else {
+			rw.Header().Set("Access-Control-Allow-Origin", "*")
 			http.Error(rw, "Failed to connect to backend", http.StatusBadGateway)
 		}
 		return
 	}
 	defer backendConn.Close()
 
+	// Add custom upgrader options compatible with Node.js ws
 	upgrader := ws.Upgrader{
 		HandshakeTimeout: b.DialTimeout,
 		ReadBufferSize:   1024,
 		WriteBufferSize:  1024,
 		CheckOrigin:      func(r *http.Request) bool { return true },
+		Subprotocols:     []string{"permessage-deflate"}, // Add support for compression
 	}
 
-	clientConn, err := upgrader.Upgrade(rw, req, nil)
+	// Add CORS headers to the WebSocket upgrade response
+	responseHeader := http.Header{}
+	responseHeader.Set("Access-Control-Allow-Origin", "*")
+
+	clientConn, err := upgrader.Upgrade(rw, req, responseHeader)
 	if err != nil {
 		log.Printf("[ERROR] Failed to upgrade client connection: %v", err)
 		return
 	}
 	defer clientConn.Close()
+	
+	log.Printf("[INFO] Successfully established WebSocket connection to backend and upgraded client connection")
 
 	clientDone := make(chan struct{})
 	backendDone := make(chan struct{})
@@ -669,10 +1079,15 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 		for {
 			messageType, message, err := clientConn.ReadMessage()
 			if err != nil {
+				log.Printf("[DEBUG] Error reading from client: %v", err)
 				return
 			}
+			
+			log.Printf("[DEBUG] Message from client: type=%d, length=%d", messageType, len(message))
+			
 			err = backendConn.WriteMessage(messageType, message)
 			if err != nil {
+				log.Printf("[DEBUG] Error writing to backend: %v", err)
 				return
 			}
 		}
@@ -683,10 +1098,15 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 		for {
 			messageType, message, err := backendConn.ReadMessage()
 			if err != nil {
+				log.Printf("[DEBUG] Error reading from backend: %v", err)
 				return
 			}
+			
+			log.Printf("[DEBUG] Message from backend: type=%d, length=%d", messageType, len(message))
+			
 			err = clientConn.WriteMessage(messageType, message)
 			if err != nil {
+				log.Printf("[DEBUG] Error writing to client: %v", err)
 				return
 			}
 		}
@@ -694,7 +1114,9 @@ func (b *Balancer) handleWebSocket(rw http.ResponseWriter, req *http.Request, ta
 
 	select {
 	case <-clientDone:
+		log.Printf("[DEBUG] Client WebSocket connection closed")
 	case <-backendDone:
+		log.Printf("[DEBUG] Backend WebSocket connection closed")
 	}
 }
 

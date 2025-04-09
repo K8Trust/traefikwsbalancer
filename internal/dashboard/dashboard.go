@@ -26,14 +26,16 @@ type PodMetrics struct {
 
 // MetricsData contains all the metrics information needed for rendering
 type MetricsData struct {
-	Timestamp         string
-	Services          []ServiceMetric
-	PodMetricsMap     map[string][]PodMetrics
-	TotalConnections  int
-	ServiceCount      int
-	PodCount          int
-	RefreshInterval   int
+	Timestamp          string
+	Services           []ServiceMetric
+	PodMetricsMap      map[string][]PodMetrics
+	TotalConnections   int
+	ServiceCount       int
+	PodCount           int
+	RefreshInterval    int
+	ForcedRefreshInterval int
 	BalancerMetricPath string
+	LastRefresh        map[string]time.Time
 }
 
 // RenderHTML renders the HTML dashboard with the provided metrics data
@@ -123,6 +125,9 @@ func getHTMLTemplate(data MetricsData) string {
                 <div class="metric-label">Last Updated</div>
                 <div class="metric-value" style="font-size: 1.2em">` + time.Now().Format("15:04:05") + `</div>
             </div>
+        </div>
+        <div class="refresh-info">
+            Cache refreshes every <span>` + fmt.Sprintf("%d", data.RefreshInterval) + `s</span> with a forced full refresh every <span>` + fmt.Sprintf("%d", data.ForcedRefreshInterval) + `s</span>
         </div>
     </div>
     
@@ -265,12 +270,14 @@ func PrepareMetricsData(
 	}
 	
 	return MetricsData{
-		Timestamp:         time.Now().Format(time.RFC3339),
-		Services:          services,
-		PodMetricsMap:     podMetricsMap,
-		TotalConnections:  totalConnections,
-		ServiceCount:      len(services),
-		PodCount:          totalPods,
-		BalancerMetricPath: balancerMetricPath,
+		Timestamp:           time.Now().Format(time.RFC3339),
+		Services:            services,
+		PodMetricsMap:       podMetricsMap,
+		TotalConnections:    totalConnections,
+		ServiceCount:        len(services),
+		PodCount:            totalPods,
+		BalancerMetricPath:  balancerMetricPath,
+		RefreshInterval:     10,
+		ForcedRefreshInterval: 30,
 	}
 }
