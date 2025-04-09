@@ -98,15 +98,21 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	// Create a more robust HTTP client with appropriate timeouts
+	// Create a wrapper function with the expected signature for Yaegi compatibility
+	dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     60 * time.Second,
 		TLSHandshakeTimeout: 5 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:         dialContext,
 	}
 	
 	httpClient := &http.Client{
