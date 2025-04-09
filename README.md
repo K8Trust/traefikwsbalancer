@@ -22,7 +22,8 @@ A high-performance WebSocket connection balancer middleware for Traefik that dis
   - TLS/SSL verification options
   - Custom header forwarding
 
-- **Pod-Level Monitoring**
+- **Pod Discovery and Monitoring**
+  - Multi-level IP scanning for pod discovery across subnets
   - Detailed metrics for individual pods
   - Visualization of connection distribution across pods
   - Enhanced debugging capabilities with pod identification
@@ -43,7 +44,7 @@ A high-performance WebSocket connection balancer middleware for Traefik that dis
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/traefikwsbalancer.git
+git clone https://github.com/K8Trust/traefikwsbalancer.git
 cd traefikwsbalancer
 ```
 
@@ -85,19 +86,40 @@ type Config struct {
     MetricPath         string        // Path to fetch connection metrics from backends
     BalancerMetricPath string        // Path to expose balancer's metrics
     Services           []string      // List of backend pod URLs
-    TLSVerify          bool          // Enable/disable TLS verification
     CacheTTL           int           // Metrics cache duration in seconds
+    EnableIPScanning   bool          // Enable scanning for pods across subnets
+    DiscoveryTimeout   int           // Timeout for pod discovery requests in seconds
 }
 ```
 
 ### Default Values
 - MetricPath: "/metric"
 - BalancerMetricPath: "/balancer-metrics"
-- TLSVerify: true
 - CacheTTL: 30 seconds
+- EnableIPScanning: false
+- DiscoveryTimeout: 2 seconds
 - DialTimeout: 10 seconds (internal)
 - WriteTimeout: 10 seconds (internal)
 - ReadTimeout: 30 seconds (internal)
+
+## Pod Discovery
+
+The plugin uses multiple strategies to discover all pods behind a service:
+
+1. **Endpoints API**: Checks if the service exposes an `/endpoints` endpoint with pod information
+2. **Direct DNS**: Attempts to find pods using DNS naming patterns like `service-1`, `service-2`, etc.
+3. **IP Scanning**: When enabled, scans neighboring IPs to discover pods:
+   - Scans the same subnet (varying the 4th octet)
+   - Scans neighboring subnets (varying the 3rd octet by ±5)
+
+For optimal pod discovery in complex environments, enable IP scanning:
+
+```yaml
+middleware:
+  traefikwsbalancer:
+    enableIPScanning: true
+    discoveryTimeout: 5  # Increase timeout for better discovery
+```
 
 ## Backend Implementation
 
@@ -196,10 +218,16 @@ The plugin provides a dedicated metrics endpoint that displays:
   "podMetrics": {
     "http://service-1.namespace.svc.cluster.local:80": [
       {
-        "agentsConnections": 42,
+        "agentsConnections": 25,
         "podName": "service-1-pod-abc123",
         "podIP": "10.0.0.1",
         "nodeName": "node-1"
+      },
+      {
+        "agentsConnections": 17,
+        "podName": "service-1-pod-def456",
+        "podIP": "10.0.0.2",
+        "nodeName": "node-2"
       }
     ]
   },
@@ -218,134 +246,95 @@ The plugin provides a dedicated metrics endpoint that displays:
 5. Sets up bidirectional relay
 6. Monitors connection health
 
-### Load Balancing Algorithm
-- Maintains cache of connection counts
-- Updates counts based on CacheTTL
-- Uses atomic operations for thread safety
-- Handles backend failures gracefully
+### Pod Discovery and Load Balancing
+1. Initial metrics request identifies at least one pod
+2. Discovery mechanisms attempt to find all related pods:
+   - First tries the endpoints API
+   - Then attempts direct DNS discovery
+   - Finally uses IP scanning (if enabled)
+3. All discovered pods contribute to the service's total connections
+4. Clients are directed to the pod with the fewest connections
 
 ## Production Deployment
 
 ### Best Practices
 1. **Security**
-   - Enable TLS verification in production
    - Implement proper origin checking
    - Set appropriate timeouts
+   - Secure the metrics endpoints if needed
 
 2. **Performance**
    - Adjust CacheTTL based on load
+   - Enable IP scanning for complete pod discovery
+   - Set appropriate discovery timeout (5 seconds recommended)
    - Monitor connection counts
-   - Set appropriate buffer sizes
 
 3. **Monitoring**
    - Use the dedicated metrics endpoint to monitor traffic distribution
    - Track pod-level metrics to identify potential hotspots
    - Monitor backend health
 
-### Example Configuration with Traefik
+### Example Traefik Static Configuration
 
 ```yaml
-# Static configuration in the Traefik config file
+# traefik.yml
 experimental:
   plugins:
     traefikwsbalancer:
       moduleName: "github.com/K8Trust/traefikwsbalancer"
-      version: "v1.0.26"
+      version: "v1.0.0"
+```
 
-# Dynamic configuration (Kubernetes CRD)
+### Example Kubernetes Configuration
+
+```yaml
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
-  name: socket-balancer
+  name: websocket-balancer
   namespace: default
 spec:
   plugin:
     traefikwsbalancer:
-      metricPath: "/metric"
-      balancerMetricPath: "/balancer-metrics"
+      metricPath: /metric
+      balancerMetricPath: /balancer-metrics
       services:
-        - "http://service-1.namespace.svc.cluster.local:80"
+        - http://my-websocket-service.default.svc.cluster.local:80
       cacheTTL: 30
+      enableIPScanning: true
+      discoveryTimeout: 5
 ```
 
-### Kubernetes Configuration
-
-For pod-level metrics to work, ensure your pods expose their identities via environment variables in your deployment:
+### IngressRoute Example
 
 ```yaml
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
 metadata:
-  name: websocket-service
+  name: websocket-route
+  namespace: default
 spec:
-  template:
-    spec:
-      containers:
-        - name: websocket-service
-          env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Connection Failures**
-   - Check backend availability
-   - Verify network connectivity
-   - Check TLS configuration
-
-2. **Performance Issues**
-   - Monitor connection counts via the metrics endpoint
-   - Adjust cache TTL
-   - Check backend resources
-
-3. **Protocol Errors**
-   - Verify WebSocket upgrade headers
-   - Check protocol compatibility
-   - Monitor message sizes
-
-4. **Missing Pod Metrics**
-   - Ensure pod environment variables are correctly set
-   - Verify backend metric endpoint returns pod information
-   - Check plugin logs for decoding errors
-
-5. **Endpoint Implementation Issues**
-   - Verify your backend's `/metric` endpoint returns valid JSON
-   - Check for proper formatting of the `agentsConnections` field
-   - Ensure connection tracking is accurately maintained
-
-### Debugging
-
-Enable detailed logging:
-```go
-log.SetFlags(log.Lshortfile | log.Ltime | log.Lmicroseconds)
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`ws.example.com`) && PathPrefix(`/socket`)
+      kind: Rule
+      middlewares:
+        - name: websocket-balancer
+          namespace: default
+      services:
+        - name: my-websocket-service
+          port: 80
+  tls: {}
 ```
 
 ## Contributing
 
-1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-![Traefik WebSocket Balancer Flow Diagram](image.png)
+Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-MIT License
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Support
 
