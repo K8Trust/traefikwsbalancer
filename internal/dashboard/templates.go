@@ -52,6 +52,7 @@ func getHTMLHeader() string {
             margin-top: 0;
         }
 
+        /* Header with title always above toolbar */
         .header {
             background: var(--header-bg);
             color: white;
@@ -59,7 +60,7 @@ func getHTMLHeader() string {
             border-radius: 12px;
             margin-bottom: 25px;
             display: flex;
-            justify-content: space-between;
+            flex-direction: column;
             align-items: center;
             box-shadow: var(--shadow);
             position: relative;
@@ -78,13 +79,17 @@ func getHTMLHeader() string {
         }
 
         .header h1 {
-            margin: 0;
+            margin: 0 0 20px 0;
             color: white;
             font-weight: 600;
             text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.2);
             display: flex;
             align-items: center;
+            justify-content: center;
             letter-spacing: 0.5px;
+            font-size: 1.8rem;
+            width: 100%;
+            text-align: center;
         }
 
         .header h1 i {
@@ -96,8 +101,10 @@ func getHTMLHeader() string {
             display: flex;
             align-items: center;
             background: rgba(255, 255, 255, 0.2);
-            padding: 10px 15px;
+            padding: 12px 20px;
             border-radius: 50px;
+            width: 100%;
+            justify-content: center;
         }
 
         .timestamp {
@@ -219,7 +226,7 @@ func getHTMLHeader() string {
         .card h2 {
             position: relative;
             padding-bottom: 12px;
-            margin-bottom: 20px;
+            margin-bottom: 25px;
             display: flex;
             align-items: center;
         }
@@ -229,10 +236,15 @@ func getHTMLHeader() string {
             position: absolute;
             left: 0;
             bottom: 0;
-            width: 50px;
+            width: 80px;
             height: 3px;
             background: var(--primary-color);
             border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        .card:hover h2::after {
+            width: 120px;
         }
 
         .card h2 i {
@@ -255,11 +267,14 @@ func getHTMLHeader() string {
             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
             position: relative;
             overflow: hidden;
-            transition: transform 0.3s ease;
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            border: 1px solid rgba(0, 0, 0, 0.05);
         }
 
         .metric-card:hover {
-            transform: translateY(-5px);
+            transform: translateY(-10px) scale(1.02);
+            box-shadow: 0 15px 35px rgba(50, 50, 93, 0.1), 0 5px 15px rgba(0, 0, 0, 0.07);
+            z-index: 10;
         }
 
         .metric-card::before {
@@ -294,6 +309,11 @@ func getHTMLHeader() string {
             line-height: 50px;
             border-radius: 50%;
             margin: 0 auto 15px;
+            transition: transform 0.5s ease;
+        }
+
+        .metric-card:hover .metric-icon {
+            transform: scale(1.15);
         }
 
         .metric-card:nth-child(2) .metric-icon {
@@ -317,6 +337,10 @@ func getHTMLHeader() string {
             color: var(--text-color);
             margin: 10px 0;
             line-height: 1;
+        }
+
+        .metric-card:hover .metric-value {
+            letter-spacing: 0.5px;
         }
 
         .metric-label {
@@ -366,13 +390,30 @@ func getHTMLHeader() string {
             background-color: rgba(52, 152, 219, 0.05);
         }
 
+        .service-connection-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .service-connection-row td:first-child {
+            width: 75%;
+        }
+
+        .service-connection-row td:last-child {
+            width: 25%;
+            text-align: right;
+        }
+
         .pod-table {
             margin-left: 30px;
-            margin-top: 10px;
+            margin-top: 12px;
             width: calc(100% - 30px);
-            border-radius: 8px;
-            box-shadow: none;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05) inset;
             background: #f9f9f9;
+            overflow: hidden;
+            border: 1px solid rgba(52, 152, 219, 0.1);
         }
 
         .pod-table th {
@@ -387,16 +428,26 @@ func getHTMLHeader() string {
             font-size: 0.95em;
         }
 
+        .pod-row:hover td {
+            background-color: rgba(52, 152, 219, 0.08);
+        }
+
         .connection-count {
             font-weight: 600;
             color: var(--primary-color);
             position: relative;
             display: inline-block;
-            padding: 4px 10px;
+            padding: 6px 12px;
             background: rgba(52, 152, 219, 0.1);
             border-radius: 15px;
             min-width: 40px;
             text-align: center;
+            transition: all 0.3s ease;
+        }
+        
+        .connection-count:hover {
+            transform: scale(1.1);
+            background: rgba(52, 152, 219, 0.2);
         }
 
         .pod-details {
@@ -411,11 +462,17 @@ func getHTMLHeader() string {
             color: var(--text-color);
             display: flex;
             align-items: center;
+            padding: 5px 0;
         }
 
         .service-name i {
             margin-right: 8px;
             color: var(--primary-color);
+            transition: all 0.3s ease;
+        }
+
+        .service-name:hover i {
+            transform: rotate(15deg);
         }
 
         .json-link {
@@ -433,7 +490,8 @@ func getHTMLHeader() string {
             border-radius: 50px;
             font-size: 0.9em;
             font-weight: 500;
-            transition: var(--transition);
+            transition: all 0.3s ease;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
         }
 
         .json-link a i {
@@ -441,37 +499,36 @@ func getHTMLHeader() string {
         }
 
         .json-link a:hover {
-            background: rgba(52, 152, 219, 0.2);
-            transform: translateY(-2px);
+            background: rgba(52, 152, 219, 0.25);
+            transform: translateY(-3px);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
         }
 
-        .pod-info {
+        .pod-info, .ip-info, .node-info {
             display: flex;
             align-items: center;
+        }
+
+        .pod-info i, .ip-info i, .node-info i {
+            margin-right: 8px;
+            transition: transform 0.3s ease;
+        }
+
+        .pod-row:hover .pod-info i,
+        .pod-row:hover .ip-info i,
+        .pod-row:hover .node-info i {
+            transform: scale(1.2);
         }
 
         .pod-info i {
-            margin-right: 8px;
             color: var(--warning-color);
         }
 
-        .node-info {
-            display: flex;
-            align-items: center;
-        }
-
         .node-info i {
-            margin-right: 8px;
             color: var(--secondary-color);
         }
 
-        .ip-info {
-            display: flex;
-            align-items: center;
-        }
-
         .ip-info i {
-            margin-right: 8px;
             color: var(--primary-color);
         }
 
@@ -479,12 +536,8 @@ func getHTMLHeader() string {
             .summary-grid {
                 grid-template-columns: 1fr;
             }
-            .header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
             .controls {
-                margin-top: 15px;
+                margin-top: 5px;
                 flex-wrap: wrap;
                 width: 100%;
                 justify-content: space-between;

@@ -160,9 +160,9 @@ func getHTMLTemplate(data MetricsData) string {
 		}
 		
 		html += `
-                <tr>
+                <tr class="service-connection-row">
                     <td><span class="service-name"><i class="fas fa-cloud"></i>` + serviceName + `</span><span class="pod-details">` + service.URL + `</span></td>
-                    <td class="connection-count">` + fmt.Sprintf("%d", service.Connections) + `</td>
+                    <td><span class="connection-count">` + fmt.Sprintf("%d", service.Connections) + `</span></td>
                 </tr>`
 		
 		// Add pod details if available
@@ -191,7 +191,7 @@ func getHTMLTemplate(data MetricsData) string {
 				html += `
                                 <tr class="pod-row">
                                     <td><span class="pod-info"><i class="fas fa-cube"></i>` + podName + `</span></td>
-                                    <td class="connection-count">` + fmt.Sprintf("%d", pod.AgentsConnections) + `</td>
+                                    <td><span class="connection-count">` + fmt.Sprintf("%d", pod.AgentsConnections) + `</span></td>
                                     <td><span class="ip-info"><i class="fas fa-network-wired"></i>` + pod.PodIP + `</span></td>
                                     <td><span class="node-info"><i class="fas fa-server"></i>` + pod.NodeName + `</span></td>
                                 </tr>`

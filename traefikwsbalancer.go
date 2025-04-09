@@ -282,9 +282,21 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 	if !endpointsFound {
 		// Discovery Method 2: Try Traefik provider endpoints
 		log.Printf("[DEBUG] Attempting pod discovery via Traefik provider for %s", service)
-		traefikProviderURL := fmt.Sprintf("http://localhost:8080/api/providers/kubernetes/services/%s/%s",
-			namespace, headlessServiceName)
 		
+		// FIX: Use proper URL construction with namespace from config
+		var traefikProviderURL string
+		if b.TraefikProviderNamespace != "" {
+			// When namespace is explicitly set in config, use it directly
+			traefikProviderURL = fmt.Sprintf("http://localhost:8080/api/providers/kubernetes/services/%s/%s",
+				b.TraefikProviderNamespace, headlessServiceName)
+			log.Printf("[DEBUG] Using configured namespace for Traefik API: %s", b.TraefikProviderNamespace)
+		} else {
+			// Otherwise, use the extracted namespace from service DNS
+			traefikProviderURL = fmt.Sprintf("http://localhost:8080/api/providers/kubernetes/services/%s/%s",
+				namespace, headlessServiceName)
+		}
+		
+		log.Printf("[DEBUG] Trying Traefik provider URL: %s", traefikProviderURL)
 		traefikResp, err := discoveryClient.Get(traefikProviderURL)
 		if err == nil {
 			defer traefikResp.Body.Close()
@@ -346,8 +358,15 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 		log.Printf("[DEBUG] Attempting to discover pods via direct Kubernetes endpoints API for %s", service)
 		
 		// Try the standard K8s API endpoint pattern
-		k8sEndpointURL := fmt.Sprintf("http://kubernetes.default.svc/api/v1/namespaces/%s/endpoints/%s", 
-			namespace, headlessServiceName)
+		// FIX: Use proper namespace from config
+		var k8sEndpointURL string
+		if b.TraefikProviderNamespace != "" {
+			k8sEndpointURL = fmt.Sprintf("http://kubernetes.default.svc/api/v1/namespaces/%s/endpoints/%s", 
+				b.TraefikProviderNamespace, headlessServiceName)
+		} else {
+			k8sEndpointURL = fmt.Sprintf("http://kubernetes.default.svc/api/v1/namespaces/%s/endpoints/%s", 
+				namespace, headlessServiceName)
+		}
 		
 		// Setup for API server authentication
 		var token []byte
@@ -428,9 +447,22 @@ func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics,
 			}
 			
 			// Try both direct pod name and with the domain
-			potentialURLs := []string{
-				fmt.Sprintf("http://%s-%d.%s%s", baseName, i, serviceBase, b.MetricPath),
-				fmt.Sprintf("http://%s-%d%s", baseName, i, b.MetricPath),
+			// FIX: Properly use namespace configuration
+			var potentialURLs []string
+			
+			if b.TraefikProviderNamespace != "" {
+				// Use the configured namespace
+				potentialURLs = []string{
+					fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local%s", 
+						baseName, i, headlessServiceName, b.TraefikProviderNamespace, b.MetricPath),
+					fmt.Sprintf("http://%s-%d%s", baseName, i, b.MetricPath),
+				}
+			} else {
+				// Use the extracted namespace
+				potentialURLs = []string{
+					fmt.Sprintf("http://%s-%d.%s%s", baseName, i, serviceBase, b.MetricPath),
+					fmt.Sprintf("http://%s-%d%s", baseName, i, b.MetricPath),
+				}
 			}
 			
 			for _, potentialURL := range potentialURLs {
