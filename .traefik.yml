@@ -9,5 +9,7 @@ testData:
   balancerMetricPath: /balancer-metrics
   services:
     - http://websocket-service-1.default.svc.cluster.local:80
-    - http://websocket-service-2.default.svc.cluster.local:80
   cacheTTL: 30
+  enableIPScanning: false
+  discoveryTimeout: 2
+  traefikProviderNamespace: ""

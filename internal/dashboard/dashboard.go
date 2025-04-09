@@ -26,13 +26,13 @@ type PodMetrics struct {
 
 // MetricsData contains all the metrics information needed for rendering
 type MetricsData struct {
-	Timestamp         string
-	Services          []ServiceMetric
-	PodMetricsMap     map[string][]PodMetrics
-	TotalConnections  int
-	ServiceCount      int
-	PodCount          int
-	RefreshInterval   int
+	Timestamp          string
+	Services           []ServiceMetric
+	PodMetricsMap      map[string][]PodMetrics
+	TotalConnections   int
+	ServiceCount       int
+	PodCount           int
+	RefreshInterval    int
 	BalancerMetricPath string
 }
 
@@ -59,6 +59,16 @@ func RenderHTML(rw http.ResponseWriter, req *http.Request, data MetricsData) {
 
 // getHTMLTemplate returns the HTML dashboard template with data inserted
 func getHTMLTemplate(data MetricsData) string {
+	// Create Israel timezone location
+	israelLocation, err := time.LoadLocation("Asia/Jerusalem")
+	if err != nil {
+		// Fallback to UTC+3 if timezone data is unavailable
+		israelLocation = time.FixedZone("Israel", 3*60*60)
+	}
+
+	// Format the time in Israel timezone
+	israelTime := time.Now().In(israelLocation).Format("15:04:05")
+	
 	// HTML header and style
 	html := getHTMLHeader()
 	
@@ -66,12 +76,12 @@ func getHTMLTemplate(data MetricsData) string {
 	html += `
 <body>
     <div class="header">
-        <h1>K8Trust WebSocket Balancer Metrics</h1>
+        <h1><i class="fas fa-network-wired"></i> K8Trust WebSocket Balancer Metrics</h1>
         <div class="controls">
-            <span class="timestamp">` + data.Timestamp + `</span>
+            <span class="timestamp"><i class="fas fa-clock"></i> ` + data.Timestamp + `</span>
             <div class="auto-refresh">
-                <input type="checkbox" id="auto-refresh" checked>
                 <label for="auto-refresh">Auto-refresh</label>
+                <input type="checkbox" id="auto-refresh" checked>
                 <select id="refresh-interval">
                     <option value="5"` + (func() string {
 						if data.RefreshInterval == 5 {
@@ -100,34 +110,38 @@ func getHTMLTemplate(data MetricsData) string {
                 </select>
                 <span id="refresh-status" class="refresh-status"></span>
             </div>
-            <button class="refresh-button" onclick="manualRefresh()">Refresh</button>
+            <button class="refresh-button" onclick="manualRefresh()"><i class="fas fa-sync-alt"></i> Refresh</button>
         </div>
     </div>
     
-    <div class="summary">
-        <h2>Summary</h2>
+    <div class="card summary">
+        <h2><i class="fas fa-chart-pie"></i> Summary</h2>
         <div class="summary-grid">
             <div class="metric-card">
-                <div class="metric-label">Total Connections</div>
+                <div class="metric-icon"><i class="fas fa-plug"></i></div>
                 <div class="metric-value">` + fmt.Sprintf("%d", data.TotalConnections) + `</div>
+                <div class="metric-label">Total Connections</div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Services</div>
+                <div class="metric-icon"><i class="fas fa-server"></i></div>
                 <div class="metric-value">` + fmt.Sprintf("%d", data.ServiceCount) + `</div>
+                <div class="metric-label">Services</div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Pods</div>
+                <div class="metric-icon"><i class="fas fa-cubes"></i></div>
                 <div class="metric-value">` + fmt.Sprintf("%d", data.PodCount) + `</div>
+                <div class="metric-label">Pods</div>
             </div>
             <div class="metric-card">
+                <div class="metric-icon"><i class="fas fa-history"></i></div>
+                <div class="metric-value" style="font-size: 1.8em">` + israelTime + `</div>
                 <div class="metric-label">Last Updated</div>
-                <div class="metric-value" style="font-size: 1.2em">` + time.Now().Format("15:04:05") + `</div>
             </div>
         </div>
     </div>
     
-    <div class="services">
-        <h2>Services & Pods</h2>
+    <div class="card services">
+        <h2><i class="fas fa-sitemap"></i> Services & Pods</h2>
         <table>
             <thead>
                 <tr>
@@ -147,7 +161,7 @@ func getHTMLTemplate(data MetricsData) string {
 		
 		html += `
                 <tr>
-                    <td><strong>` + serviceName + `</strong><br><span class="pod-details">` + service.URL + `</span></td>
+                    <td><span class="service-name"><i class="fas fa-cloud"></i>` + serviceName + `</span><span class="pod-details">` + service.URL + `</span></td>
                     <td class="connection-count">` + fmt.Sprintf("%d", service.Connections) + `</td>
                 </tr>`
 		
@@ -176,10 +190,10 @@ func getHTMLTemplate(data MetricsData) string {
 				
 				html += `
                                 <tr class="pod-row">
-                                    <td>` + podName + `</td>
+                                    <td><span class="pod-info"><i class="fas fa-cube"></i>` + podName + `</span></td>
                                     <td class="connection-count">` + fmt.Sprintf("%d", pod.AgentsConnections) + `</td>
-                                    <td>` + pod.PodIP + `</td>
-                                    <td>` + pod.NodeName + `</td>
+                                    <td><span class="ip-info"><i class="fas fa-network-wired"></i>` + pod.PodIP + `</span></td>
+                                    <td><span class="node-info"><i class="fas fa-server"></i>` + pod.NodeName + `</span></td>
                                 </tr>`
 			}
 			
@@ -196,7 +210,7 @@ func getHTMLTemplate(data MetricsData) string {
         </table>
         
         <div class="json-link">
-            <a href="` + data.BalancerMetricPath + `?format=json">View as JSON</a>
+            <a href="` + data.BalancerMetricPath + `?format=json"><i class="fas fa-code"></i> View as JSON</a>
         </div>
     </div>`
     
@@ -215,6 +229,16 @@ func PrepareMetricsData(
 	podMetricsMap map[string][]PodMetrics,
 	balancerMetricPath string,
 ) MetricsData {
+	// Create Israel timezone location
+	israelLocation, err := time.LoadLocation("Asia/Jerusalem")
+	if err != nil {
+		// Fallback to UTC+3 if timezone data is unavailable
+		israelLocation = time.FixedZone("Israel", 3*60*60)
+	}
+	
+	// Format timestamp with Israel timezone
+	timestamp := time.Now().In(israelLocation).Format(time.RFC3339)
+	
 	// Calculate total connections
 	totalConnections := 0
 	for _, count := range serviceConnections {
@@ -265,12 +289,12 @@ func PrepareMetricsData(
 	}
 	
 	return MetricsData{
-		Timestamp:         time.Now().Format(time.RFC3339),
-		Services:          services,
-		PodMetricsMap:     podMetricsMap,
-		TotalConnections:  totalConnections,
-		ServiceCount:      len(services),
-		PodCount:          totalPods,
+		Timestamp:          timestamp,
+		Services:           services,
+		PodMetricsMap:      podMetricsMap,
+		TotalConnections:   totalConnections,
+		ServiceCount:       len(services),
+		PodCount:           totalPods,
 		BalancerMetricPath: balancerMetricPath,
 	}
 }
