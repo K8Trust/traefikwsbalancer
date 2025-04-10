@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -43,7 +44,7 @@ func CreateConfig() *Config {
 		BalancerMetricPath:        "/balancer-metrics",
 		CacheTTL:                  30,
 		EnableIPScanning:          false,
-		DiscoveryTimeout:          2,
+		DiscoveryTimeout:          5, // Increased from default 2
 		TraefikProviderNamespace:  "",
 		EnablePrometheusDiscovery: true,
 		PrometheusURL:             "http://localhost:8080/metrics",
@@ -88,11 +89,18 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		log.Printf("[DEBUG] Service %d: %s", i+1, service)
 	}
 
+	// Ensure discovery timeout is at least 5 seconds
+	discoveryTimeout := time.Duration(config.DiscoveryTimeout) * time.Second
+	if discoveryTimeout < 5*time.Second {
+		discoveryTimeout = 5 * time.Second
+		log.Printf("[INFO] DiscoveryTimeout increased to minimum 5 seconds")
+	}
+
 	b := &Balancer{
 		Next:                      next,
 		Name:                      name,
 		Services:                  config.Services,
-		Client:                    &http.Client{Timeout: 5 * time.Second},
+		Client:                    &http.Client{Timeout: 10 * time.Second}, // Increased from 5 seconds
 		MetricPath:                config.MetricPath,
 		BalancerMetricPath:        config.BalancerMetricPath,
 		cacheTTL:                  time.Duration(config.CacheTTL) * time.Second,
@@ -100,7 +108,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		WriteTimeout:              10 * time.Second,
 		ReadTimeout:               30 * time.Second,
 		EnableIPScanning:          config.EnableIPScanning,
-		DiscoveryTimeout:          time.Duration(config.DiscoveryTimeout) * time.Second,
+		DiscoveryTimeout:          discoveryTimeout,
 		TraefikProviderNamespace:  config.TraefikProviderNamespace,
 		EnablePrometheusDiscovery: config.EnablePrometheusDiscovery,
 		PrometheusURL:             config.PrometheusURL,
@@ -186,11 +194,33 @@ func (b *Balancer) getServiceEndpoints(service string) ([]string, error) {
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		// Add proper timeout configuration for the transport
+		DialContext: (&net.Dialer{
+			Timeout:   b.DiscoveryTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: b.DiscoveryTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSHandshakeTimeout:   b.DiscoveryTimeout,
 	}
-	k8sClient := &http.Client{Transport: tr, Timeout: b.DiscoveryTimeout}
+	
+	// Create a context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), b.DiscoveryTimeout)
+	defer cancel()
+	
+	// Create a new request with the context
+	req = req.WithContext(ctx)
+	
+	k8sClient := &http.Client{
+		Transport: tr,
+		Timeout:   b.DiscoveryTimeout,
+	}
 
+	log.Printf("[DEBUG] Sending K8s API request with timeout %v", b.DiscoveryTimeout)
+	
 	resp, err := k8sClient.Do(req)
 	if err != nil {
+		log.Printf("[ERROR] Failed to fetch endpoints for %s: %v", service, err)
 		return nil, fmt.Errorf("failed to fetch endpoints for %s: %v", service, err)
 	}
 	defer resp.Body.Close()
@@ -211,7 +241,9 @@ func (b *Balancer) getServiceEndpoints(service string) ([]string, error) {
 			} `json:"addresses"`
 		} `json:"subsets"`
 	}
+	
 	if err := json.Unmarshal(body, &endpoint); err != nil {
+		log.Printf("[ERROR] Failed to parse endpoint response: %v, body: %s", err, string(body))
 		return nil, fmt.Errorf("failed to parse endpoint response: %v", err)
 	}
 
@@ -267,7 +299,8 @@ func (b *Balancer) getDirectEndpoints(service string) []string {
 // GetAllPodsForService discovers all pods behind a service and fetches their metrics.
 func (b *Balancer) GetAllPodsForService(service string) ([]dashboard.PodMetrics, error) {
 	log.Printf("[DEBUG] Fetching connections from service %s using metric path %s", service, b.MetricPath)
-	resp, err := b.Client.Get(service + b.MetricPath)
+	client := &http.Client{Timeout: b.DiscoveryTimeout} // Use discovery timeout here
+	resp, err := client.Get(service + b.MetricPath)
 	if err != nil {
 		log.Printf("[ERROR] Failed to fetch connections from service %s: %v", service, err)
 		return nil, err
