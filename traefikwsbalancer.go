@@ -195,10 +195,13 @@ func (b *Balancer) getServiceEndpoints(service string) ([]string, error) {
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		// Add proper timeout configuration for the transport
-		DialContext: (&net.Dialer{
-			Timeout:   b.DiscoveryTimeout,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout:   b.DiscoveryTimeout,
+				KeepAlive: 30 * time.Second,
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
 		ResponseHeaderTimeout: b.DiscoveryTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSHandshakeTimeout:   b.DiscoveryTimeout,
