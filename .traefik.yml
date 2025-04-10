@@ -11,5 +11,5 @@ testData:
     - http://websocket-service-1.default.svc.cluster.local:80
   cacheTTL: 30
   enableIPScanning: false
-  discoveryTimeout: 2
+  discoveryTimeout: 30
   traefikProviderNamespace: ""

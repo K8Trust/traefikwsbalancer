@@ -44,7 +44,7 @@ func CreateConfig() *Config {
 		BalancerMetricPath:        "/balancer-metrics",
 		CacheTTL:                  30,
 		EnableIPScanning:          false,
-		DiscoveryTimeout:          5, // Increased from default 2
+		DiscoveryTimeout:          30, // Increased from 5 to 30 seconds
 		TraefikProviderNamespace:  "",
 		EnablePrometheusDiscovery: true,
 		PrometheusURL:             "http://localhost:8080/metrics",
@@ -89,24 +89,24 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		log.Printf("[DEBUG] Service %d: %s", i+1, service)
 	}
 
-	// Ensure discovery timeout is at least 5 seconds
+	// Ensure discovery timeout is at least 30 seconds
 	discoveryTimeout := time.Duration(config.DiscoveryTimeout) * time.Second
-	if discoveryTimeout < 5*time.Second {
-		discoveryTimeout = 5 * time.Second
-		log.Printf("[INFO] DiscoveryTimeout increased to minimum 5 seconds")
+	if discoveryTimeout < 30*time.Second {
+		discoveryTimeout = 30 * time.Second
+		log.Printf("[INFO] DiscoveryTimeout increased to minimum 30 seconds")
 	}
 
 	b := &Balancer{
 		Next:                      next,
 		Name:                      name,
 		Services:                  config.Services,
-		Client:                    &http.Client{Timeout: 10 * time.Second}, // Increased from 5 seconds
+		Client:                    &http.Client{Timeout: 30 * time.Second}, // Increased from 10 seconds
 		MetricPath:                config.MetricPath,
 		BalancerMetricPath:        config.BalancerMetricPath,
 		cacheTTL:                  time.Duration(config.CacheTTL) * time.Second,
-		DialTimeout:               10 * time.Second,
-		WriteTimeout:              10 * time.Second,
-		ReadTimeout:               30 * time.Second,
+		DialTimeout:               30 * time.Second, // Increased from 10 seconds
+		WriteTimeout:              30 * time.Second, // Increased from 10 seconds
+		ReadTimeout:               60 * time.Second, // Increased from 30 seconds
 		EnableIPScanning:          config.EnableIPScanning,
 		DiscoveryTimeout:          discoveryTimeout,
 		TraefikProviderNamespace:  config.TraefikProviderNamespace,
@@ -197,18 +197,18 @@ func (b *Balancer) getServiceEndpoints(service string) ([]string, error) {
 		// Add proper timeout configuration for the transport
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialer := &net.Dialer{
-				Timeout:   b.DiscoveryTimeout,
+				Timeout:   30 * time.Second, // Increased timeout
 				KeepAlive: 30 * time.Second,
 			}
 			return dialer.DialContext(ctx, network, addr)
 		},
-		ResponseHeaderTimeout: b.DiscoveryTimeout,
-		ExpectContinueTimeout: 1 * time.Second,
-		TLSHandshakeTimeout:   b.DiscoveryTimeout,
+		ResponseHeaderTimeout: 30 * time.Second, // Increased timeout
+		ExpectContinueTimeout: 5 * time.Second,  // Increased timeout
+		TLSHandshakeTimeout:   30 * time.Second, // Increased timeout
 	}
 	
-	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), b.DiscoveryTimeout)
+	// Create a context with timeout - increase to 30 seconds
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	
 	// Create a new request with the context
@@ -216,10 +216,10 @@ func (b *Balancer) getServiceEndpoints(service string) ([]string, error) {
 	
 	k8sClient := &http.Client{
 		Transport: tr,
-		Timeout:   b.DiscoveryTimeout,
+		Timeout:   30 * time.Second, // Increased timeout
 	}
 
-	log.Printf("[DEBUG] Sending K8s API request with timeout %v", b.DiscoveryTimeout)
+	log.Printf("[DEBUG] Sending K8s API request with timeout %v", 30*time.Second)
 	
 	resp, err := k8sClient.Do(req)
 	if err != nil {
