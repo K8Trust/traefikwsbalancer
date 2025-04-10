@@ -41,7 +41,7 @@ func getHTMLHeader() string {
             color: var(--text-color);
             max-width: 1200px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 10px;
             background-color: var(--bg-color);
             background-image: linear-gradient(to bottom right, rgba(236, 240, 241, 0.8), rgba(189, 195, 199, 0.4));
             background-attachment: fixed;
@@ -55,7 +55,7 @@ func getHTMLHeader() string {
         .header {
             background: var(--header-bg);
             color: white;
-            padding: 25px;
+            padding: 20px 15px;
             border-radius: 12px;
             margin-bottom: 25px;
             display: flex;
@@ -211,7 +211,7 @@ func getHTMLHeader() string {
         .card {
             background-color: var(--card-bg);
             border-radius: 12px;
-            padding: 25px;
+            padding: 20px 15px;
             margin-bottom: 25px;
             box-shadow: var(--shadow);
             transition: var(--transition);
@@ -228,6 +228,7 @@ func getHTMLHeader() string {
             margin-bottom: 25px;
             display: flex;
             align-items: center;
+            font-size: 1.5rem;
         }
 
         .card h2::after {
@@ -253,7 +254,7 @@ func getHTMLHeader() string {
 
         .summary-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 20px;
             margin-top: 20px;
         }
@@ -531,35 +532,179 @@ func getHTMLHeader() string {
             color: var(--primary-color);
         }
 
-        @media (max-width: 768px) {
+        /* Enhanced Responsive Styles */
+        @media (max-width: 992px) {
             .summary-grid {
-                grid-template-columns: 1fr;
+                grid-template-columns: repeat(2, 1fr);
             }
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 8px;
+            }
+            
+            .header {
+                padding: 15px 10px;
+            }
+            
+            .header h1 {
+                font-size: 1.5rem;
+            }
+            
+            .header h1 i {
+                font-size: 1.5rem;
+            }
+            
+            .card {
+                padding: 15px 12px;
+            }
+            
             .controls {
-                margin-top: 5px;
-                flex-wrap: wrap;
-                width: 100%;
-                justify-content: space-between;
+                flex-direction: column;
+                padding: 10px;
+                border-radius: 8px;
             }
+            
+            .timestamp {
+                margin-right: 0;
+                margin-bottom: 10px;
+                width: 100%;
+                justify-content: center;
+            }
+            
             .auto-refresh {
-                margin-top: 10px;
+                margin-right: 0;
                 margin-bottom: 10px;
                 width: 100%;
                 justify-content: space-between;
             }
+            
             .refresh-status {
                 margin-top: 5px;
                 width: 100%;
                 text-align: center;
             }
+            
             .refresh-button {
-                margin-top: 10px;
+                margin-top: 5px;
                 width: 100%;
                 justify-content: center;
             }
+            
             .pod-table {
                 margin-left: 0;
                 width: 100%;
+            }
+        }
+
+        @media (max-width: 576px) {
+            .summary-grid {
+                grid-template-columns: 1fr;
+                gap: 15px;
+            }
+            
+            .metric-card {
+                padding: 15px;
+            }
+            
+            .service-connection-row {
+                flex-direction: column;
+            }
+            
+            .service-connection-row td:first-child,
+            .service-connection-row td:last-child {
+                width: 100%;
+                text-align: left;
+            }
+            
+            .service-connection-row td:last-child {
+                padding-top: 0;
+            }
+            
+            .connection-count {
+                margin-top: 5px;
+            }
+            
+            table, thead, tbody, th, td, tr {
+                display: block;
+            }
+            
+            thead tr {
+                position: absolute;
+                top: -9999px;
+                left: -9999px;
+            }
+            
+            tr {
+                margin-bottom: 15px;
+                border: 1px solid #f1f1f1;
+                border-radius: 8px;
+                overflow: hidden;
+            }
+            
+            td {
+                border: none;
+                position: relative;
+                padding: 12px 10px;
+            }
+            
+            td:before {
+                position: absolute;
+                top: 12px;
+                left: 10px;
+                width: 45%;
+                padding-right: 10px;
+                white-space: nowrap;
+                font-weight: 600;
+            }
+            
+            .pod-row td {
+                padding: 10px 8px;
+                text-align: center;
+            }
+            
+            .pod-info, .ip-info, .node-info {
+                justify-content: center;
+            }
+            
+            /* Custom table styles for responsive view */
+            .pod-table td:nth-of-type(1):before { content: "Pod Name:"; }
+            .pod-table td:nth-of-type(2):before { content: "Connections:"; }
+            .pod-table td:nth-of-type(3):before { content: "Pod IP:"; }
+            .pod-table td:nth-of-type(4):before { content: "Node:"; }
+            
+            .pod-table td:before {
+                position: static;
+                display: block;
+                text-align: center;
+                margin-bottom: 5px;
+                width: 100%;
+            }
+            
+            .pod-table td {
+                width: 100%;
+                text-align: center;
+                padding-left: 10px;
+            }
+        }
+        
+        /* Ultra small devices */
+        @media (max-width: 320px) {
+            .header h1 {
+                font-size: 1.3rem;
+            }
+            
+            .card h2 {
+                font-size: 1.3rem;
+            }
+            
+            .metric-value {
+                font-size: 2em;
+            }
+            
+            .metric-card {
+                padding: 12px 10px;
             }
         }
     </style>
@@ -638,6 +783,18 @@ func getJavaScript(refreshInterval int) string {
             } else {
                 statusElement.textContent = 'Paused';
             }
+        }
+        
+        // Add event listener for orientation change or resize
+        window.addEventListener('resize', function() {
+            // Any additional adjustments needed on resize
+        });
+        
+        // Mobile device detection to adjust UI elements
+        const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+        if (isMobile) {
+            // Specific adjustments for mobile devices if needed
+            document.body.classList.add('mobile-device');
         }
     </script>`, refreshInterval)
 }
