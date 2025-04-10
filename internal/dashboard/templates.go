@@ -4,7 +4,7 @@ import (
 	"fmt"
 )
 
-// getHTMLHeader returns the HTML header and CSS styles
+// getHTMLHeader returns the HTML header and CSS styles.
 func getHTMLHeader() string {
 	return `<!DOCTYPE html>
 <html>
@@ -52,7 +52,6 @@ func getHTMLHeader() string {
             margin-top: 0;
         }
 
-        /* Header with title always above toolbar */
         .header {
             background: var(--header-bg);
             color: white;
@@ -338,7 +337,7 @@ func getHTMLHeader() string {
             margin: 10px 0;
             line-height: 1;
         }
-
+        
         .metric-card:hover .metric-value {
             letter-spacing: 0.5px;
         }
@@ -567,7 +566,7 @@ func getHTMLHeader() string {
 </head>`
 }
 
-// getJavaScript returns the JavaScript code for auto-refresh functionality
+// getJavaScript returns the JavaScript code for auto-refresh functionality.
 func getJavaScript(refreshInterval int) string {
 	return fmt.Sprintf(`
     <script>
@@ -578,24 +577,19 @@ func getJavaScript(refreshInterval int) string {
         const autoRefreshCheckbox = document.getElementById('auto-refresh');
         const refreshIntervalSelect = document.getElementById('refresh-interval');
         
-        // Initialize the refresh status
         updateRefreshStatus();
         
-        // Setup event listeners
         autoRefreshCheckbox.addEventListener('change', toggleAutoRefresh);
         refreshIntervalSelect.addEventListener('change', changeRefreshInterval);
         
-        // Start auto-refresh if enabled
         if (autoRefreshCheckbox.checked) {
             startAutoRefresh();
         }
         
-        // Function to handle manual refresh button
         function manualRefresh() {
             window.location.reload();
         }
         
-        // Function to toggle auto-refresh
         function toggleAutoRefresh() {
             if (autoRefreshCheckbox.checked) {
                 startAutoRefresh();
@@ -604,11 +598,8 @@ func getJavaScript(refreshInterval int) string {
             }
         }
         
-        // Function to change refresh interval
         function changeRefreshInterval() {
             countdownValue = parseInt(refreshIntervalSelect.value);
-            
-            // Restart auto-refresh if it's enabled
             if (autoRefreshCheckbox.checked) {
                 stopAutoRefresh();
                 startAutoRefresh();
@@ -617,42 +608,30 @@ func getJavaScript(refreshInterval int) string {
             }
         }
         
-        // Function to start auto-refresh
         function startAutoRefresh() {
             countdownValue = parseInt(refreshIntervalSelect.value);
             updateRefreshStatus();
-            
-            // Clear any existing timers
             stopAutoRefresh();
-            
-            // Start countdown
             countdownTimer = setInterval(updateCountdown, 1000);
-            
-            // Set refresh timer
             refreshTimer = setTimeout(function() {
-                window.location.href = window.location.pathname + 
-                    '?refreshInterval=' + refreshIntervalSelect.value;
+                window.location.href = window.location.pathname + '?refreshInterval=' + refreshIntervalSelect.value;
             }, countdownValue * 1000);
         }
         
-        // Function to stop auto-refresh
         function stopAutoRefresh() {
             clearTimeout(refreshTimer);
             clearInterval(countdownTimer);
             statusElement.textContent = 'Paused';
         }
         
-        // Function to update countdown
         function updateCountdown() {
             countdownValue--;
             updateRefreshStatus();
-            
             if (countdownValue <= 0) {
                 clearInterval(countdownTimer);
             }
         }
         
-        // Function to update refresh status text
         function updateRefreshStatus() {
             if (autoRefreshCheckbox.checked) {
                 statusElement.textContent = 'Refreshing in ' + countdownValue + 's';
