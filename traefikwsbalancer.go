@@ -35,6 +35,7 @@ type Config struct {
 	TraefikProviderNamespace  string   `json:"traefikProviderNamespace" yaml:"traefikProviderNamespace"`
 	EnablePrometheusDiscovery bool     `json:"enablePrometheusDiscovery" yaml:"enablePrometheusDiscovery"`
 	PrometheusURL             string   `json:"prometheusURL" yaml:"prometheusURL"`
+	DisableKubernetesDiscovery bool     `json:"disableKubernetesDiscovery" yaml:"disableKubernetesDiscovery"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -48,6 +49,7 @@ func CreateConfig() *Config {
 		TraefikProviderNamespace:  "",
 		EnablePrometheusDiscovery: true,
 		PrometheusURL:             "http://localhost:8080/metrics",
+		DisableKubernetesDiscovery: false,
 	}
 }
 
@@ -76,6 +78,7 @@ type Balancer struct {
 	TraefikProviderNamespace  string
 	EnablePrometheusDiscovery bool
 	PrometheusURL             string
+	DisableKubernetesDiscovery bool
 }
 
 // New creates a new plugin instance.
@@ -112,6 +115,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		TraefikProviderNamespace:  config.TraefikProviderNamespace,
 		EnablePrometheusDiscovery: config.EnablePrometheusDiscovery,
 		PrometheusURL:             config.PrometheusURL,
+		DisableKubernetesDiscovery: config.DisableKubernetesDiscovery,
 	}
 	// Start asynchronous background cache refresh.
 	b.StartBackgroundRefresh()
@@ -163,6 +167,12 @@ func (b *Balancer) GetConnections(service string) (int, []dashboard.PodMetrics, 
 
 // getServiceEndpoints queries Kubernetes API for the endpoints of a given service.
 func (b *Balancer) getServiceEndpoints(service string) ([]string, error) {
+	// If Kubernetes discovery is disabled, just return the service itself as the endpoint
+	if b.DisableKubernetesDiscovery {
+		log.Printf("[DEBUG] Kubernetes endpoint discovery disabled, using service as direct endpoint: %s", service)
+		return []string{service}, nil
+	}
+
 	// Extract service name and namespace from the service URL.
 	serviceBase := strings.TrimPrefix(service, "http://")
 	serviceParts := strings.Split(serviceBase, ".")
@@ -186,14 +196,16 @@ func (b *Balancer) getServiceEndpoints(service string) ([]string, error) {
 		token, _ = os.ReadFile(tokenPath)
 	}
 
-	k8sEndpointURL := fmt.Sprintf("http://kubernetes.default.svc/api/v1/namespaces/%s/endpoints/%s", namespace, serviceName)
+	k8sEndpointURL := fmt.Sprintf("https://kubernetes.default.svc/api/v1/namespaces/%s/endpoints/%s", namespace, serviceName)
 	req, _ := http.NewRequest("GET", k8sEndpointURL, nil)
 	if token != nil {
 		req.Header.Set("Authorization", "Bearer "+string(token))
 	}
 
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Only for testing! In production, use proper CA verification
+		},
 		// Add proper timeout configuration for the transport
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialer := &net.Dialer{
